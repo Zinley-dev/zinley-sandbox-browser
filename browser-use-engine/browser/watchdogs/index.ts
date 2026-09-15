@@ -1,0 +1,12 @@
+export { DOMWatchdog } from './dom_watchdog.js';
+export { DownloadsWatchdog } from './downloads_watchdog.js';
+export { DefaultActionWatchdog } from './default_action_watchdog.js';
+export { PopupsWatchdog } from './popups_watchdog.js';
+export { SecurityWatchdog } from './security_watchdog.js';
+export { AboutBlankWatchdog } from './about_blank_watchdog.js';
+export { CrashWatchdog } from './crash_watchdog.js';
+export { LocalBrowserWatchdog } from './local_browser_watchdog.js';
+export { PermissionsWatchdog } from './permissions_watchdog.js';
+export { RecordingWatchdog } from './recording_watchdog.js';
+export { ScreenshotWatchdog } from './screenshot_watchdog.js';
+export { StorageStateWatchdog } from './storage_state_watchdog.js';

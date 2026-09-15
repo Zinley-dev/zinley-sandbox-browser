@@ -1,0 +1,37 @@
+{
+  "name": "zinley-sandbox-browser",
+  "version": "1.0.0",
+  "description": "Browser runtime for Zinley's Computer: the browser-use engine as a small daemon that drives a headful Chromium inside a Daytona sandbox, with live view and human takeover.",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zinley-dev/zinley-sandbox-browser.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node zbrowser/build.mjs",
+    "setup": "bash install.sh"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.32.1",
+    "adm-zip": "0.5.16",
+    "axios": "1.13.2",
+    "eventemitter3": "5.0.1",
+    "gpt-tokenizer": "3.4.0",
+    "minimatch": "10.1.1",
+    "openai": "4.104.0",
+    "otpauth": "9.4.1",
+    "patchright": "1.57.0",
+    "uuid": "13.0.0",
+    "winston": "3.19.0",
+    "zod": "3.25.76",
+    "zod-to-json-schema": "3.25.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.27.2",
+    "typescript": "5.9.2"
+  }
+}
