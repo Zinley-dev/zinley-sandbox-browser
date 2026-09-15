@@ -1,6 +1,6 @@
 {
   "name": "zinley-sandbox-browser",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Browser runtime for Zinley's Computer: the browser-use engine as a small daemon that drives a headful Chromium inside a Daytona sandbox, with live view and human takeover.",
   "license": "MIT",
   "private": true,

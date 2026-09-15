@@ -336,8 +336,18 @@ export class BrowserSession {
 			}
 		}
 
-		// Create initial page
-		const page = await this.context.newPage();
+		// Initial page: a persistent context already opens one about:blank tab.
+		// Reuse it — creating another here left a stray blank tab in EVERY
+		// session (visible to the user on takeover / in the desktop window).
+		// Any further blank tabs the profile restored are closed; real restored
+		// pages are left alone.
+		const preOpened = this.context.pages();
+		const page = preOpened.find(p => this.isNewTabPage(p.url())) ?? (await this.context.newPage());
+		for (const extra of preOpened) {
+			if (extra !== page && this.isNewTabPage(extra.url())) {
+				await extra.close().catch(() => undefined);
+			}
+		}
 		const pageId = this.generatePageId();
 		this.pages.set(pageId, page);
 		this.currentPageId = pageId;

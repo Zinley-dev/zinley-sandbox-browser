@@ -158,6 +158,8 @@ export function parseZbOutput<T = unknown>(output: string): ZbResponse<T> | null
 export interface ZbHandoffCard {
   v: 1;
   viewUrl: string;
+  /** Shortened viewUrl for text channels (SMS/iMessage/Telegram). */
+  shortUrl?: string;
   reason: string;
   whatToDo?: string;
   pageUrl?: string;
@@ -165,6 +167,9 @@ export interface ZbHandoffCard {
   expiresAt: string;
   conversationId?: string;
 }
+
+/** Hosts of the takeover link — used to suppress link previews on chat apps. */
+export const ZB_VIEW_URL_RE = /https?:\/\/[^\s"'<>]*proxy\.daytona\.app\/[^\s"'<>]*/i;
 
 export function encodeHandoffLine(card: ZbHandoffCard): string {
   return `${ZB_HANDOFF_MARKER} ${JSON.stringify(card)}`;

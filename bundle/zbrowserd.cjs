@@ -36484,7 +36484,13 @@ var BrowserSession = class {
         console.warn(`\u26A0\uFE0F [BrowserSession] Failed to apply imported cookies: ${error.message}`);
       }
     }
-    const page = await this.context.newPage();
+    const preOpened = this.context.pages();
+    const page = preOpened.find((p2) => this.isNewTabPage(p2.url())) ?? await this.context.newPage();
+    for (const extra of preOpened) {
+      if (extra !== page && this.isNewTabPage(extra.url())) {
+        await extra.close().catch(() => void 0);
+      }
+    }
     const pageId = this.generatePageId();
     this.pages.set(pageId, page);
     this.currentPageId = pageId;
