@@ -55301,7 +55301,7 @@ ${elements}`;
       highlighted = await drawIndexOverlay(page, selectorMap);
     }
     try {
-      const buf = await page.screenshot({ type: "jpeg", quality: opts.jpegQuality ?? 60, timeout: 15e3 });
+      const buf = await page.screenshot({ type: "jpeg", quality: opts.jpegQuality ?? 50, scale: "css", timeout: 15e3 });
       out.screenshot = buf.toString("base64");
       out.screenshotMime = "image/jpeg";
     } catch (err) {
@@ -55383,7 +55383,18 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
     }
   }
   if (actions.length > max) interrupted = interrupted ?? `Only the first ${max} actions were run.`;
+  if (results.some((r2) => r2.ok)) await settleAfterActions(session);
   return { ok: results.length > 0 && results.every((r2) => r2.ok), results, interrupted };
+}
+async function settleAfterActions(session) {
+  try {
+    const page = session.getPageOrCurrent();
+    await page.waitForLoadState("domcontentloaded", { timeout: 2e3 }).catch(() => void 0);
+    const idle = session.waitForNetworkIdle;
+    if (typeof idle === "function") await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => void 0);
+    await new Promise((resolve2) => setTimeout(resolve2, 150));
+  } catch {
+  }
 }
 
 // src/services/sandbox-browser/protocol.ts

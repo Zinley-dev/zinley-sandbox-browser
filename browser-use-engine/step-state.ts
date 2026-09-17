@@ -111,7 +111,8 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 			highlighted = await drawIndexOverlay(page, selectorMap);
 		}
 		try {
-			const buf: Buffer = await page.screenshot({ type: 'jpeg', quality: opts.jpegQuality ?? 60, timeout: 15000 });
+			// CSS-pixel scale: a Retina desktop would otherwise send a 2× image (4× the bytes and tokens).
+			const buf: Buffer = await page.screenshot({ type: 'jpeg', quality: opts.jpegQuality ?? 50, scale: 'css', timeout: 15000 });
 			out.screenshot = buf.toString('base64');
 			out.screenshotMime = 'image/jpeg';
 		} catch (err: any) {
@@ -248,5 +249,24 @@ export async function runStepActions(
 		}
 	}
 	if (actions.length > max) interrupted = interrupted ?? `Only the first ${max} actions were run.`;
+	if (results.some(r => r.ok)) await settleAfterActions(session);
 	return { ok: results.length > 0 && results.every(r => r.ok), results, interrupted };
+}
+
+/**
+ * Let the page catch up before it is read: a click that navigates, a submit,
+ * a suggestion dropdown — reading the DOM the same millisecond returns the
+ * old page and the model acts on stale indices. Bounded (≤ ~2 s), never throws.
+ */
+export async function settleAfterActions(session: BrowserSession): Promise<void> {
+	try {
+		const page: any = session.getPageOrCurrent();
+		await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => undefined);
+		const idle = (session as any).waitForNetworkIdle;
+		// The engine's helper counts in SECONDS.
+		if (typeof idle === 'function') await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => undefined);
+		await new Promise(resolve => setTimeout(resolve, 150));
+	} catch {
+		/* best effort */
+	}
 }
