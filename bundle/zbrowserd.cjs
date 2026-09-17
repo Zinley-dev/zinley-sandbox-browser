@@ -55295,25 +55295,63 @@ ${elements}`;
     if (state.isPdfViewer) out.notes.push("This is a PDF viewer \u2014 extract cannot read it; scroll to read it, or download the file.");
   }
   if (wantShot) {
+    const page = session.getPageOrCurrent();
     let highlighted = false;
     if (opts.highlight !== false && selectorMap && selectorMap.size > 0) {
-      try {
-        await session.addHighlights(selectorMap);
-        highlighted = true;
-      } catch {
-      }
+      highlighted = await drawIndexOverlay(page, selectorMap);
     }
     try {
-      const page = session.getPageOrCurrent();
       const buf = await page.screenshot({ type: "jpeg", quality: opts.jpegQuality ?? 60, timeout: 15e3 });
       out.screenshot = buf.toString("base64");
       out.screenshotMime = "image/jpeg";
     } catch (err) {
       out.notes.push(`Screenshot failed (${String(err?.message || err).slice(0, 80)}).`);
     }
-    if (highlighted) await session.removeHighlights().catch(() => void 0);
+    if (highlighted) await page.evaluate(REMOVE_OVERLAY_SCRIPT).catch(() => void 0);
   }
   return out;
+}
+var OVERLAY_ID = "zinley-step-index-overlay";
+var REMOVE_OVERLAY_SCRIPT = `(() => { const c = document.getElementById(${JSON.stringify(OVERLAY_ID)}); if (c) c.remove(); })()`;
+async function drawIndexOverlay(page, selectorMap) {
+  const boxes = [];
+  for (const [index, node] of selectorMap.entries()) {
+    const p2 = node?.absolutePosition || node?.snapshotNode?.bounds;
+    if (!p2 || !(p2.width > 0) || !(p2.height > 0)) continue;
+    boxes.push({ i: index, x: p2.x, y: p2.y, w: p2.width, h: p2.height, t: String(node?.nodeName || node?.tagName || "").toLowerCase() });
+  }
+  if (boxes.length === 0) return false;
+  const script = `(() => {
+		const data = ${JSON.stringify(boxes)};
+		const id = ${JSON.stringify(OVERLAY_ID)};
+		const old = document.getElementById(id); if (old) old.remove();
+		const sx = window.scrollX, sy = window.scrollY, vw = window.innerWidth, vh = window.innerHeight;
+		const root = document.createElement('div');
+		root.id = id;
+		root.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
+		const colors = { a: '#2563eb', button: '#dc2626', input: '#059669', textarea: '#059669', select: '#7c3aed' };
+		for (const b of data) {
+			const x = b.x - sx, y = b.y - sy;
+			if (x + b.w < 0 || y + b.h < 0 || x > vw || y > vh) continue;
+			const c = colors[b.t] || '#ea580c';
+			const box = document.createElement('div');
+			box.style.cssText = 'position:fixed;box-sizing:border-box;border:2px solid ' + c + ';background:' + c + '14;left:' + x + 'px;top:' + y + 'px;width:' + b.w + 'px;height:' + b.h + 'px;';
+			const label = document.createElement('div');
+			label.textContent = String(b.i);
+			const above = y >= 14;
+			label.style.cssText = 'position:absolute;left:0;' + (above ? 'top:-14px;' : 'top:0;') + 'padding:0 3px;font:bold 11px/14px system-ui,Arial,sans-serif;color:#fff;background:' + c + ';border-radius:2px;white-space:nowrap;';
+			box.appendChild(label);
+			root.appendChild(box);
+		}
+		document.documentElement.appendChild(root);
+		return root.childElementCount;
+	})()`;
+  try {
+    const drawn = await page.evaluate(script);
+    return Number(drawn) > 0;
+  } catch {
+    return false;
+  }
 }
 async function runStepActions(session, registry, actions, context, opts = {}) {
   const max = opts.max ?? 5;

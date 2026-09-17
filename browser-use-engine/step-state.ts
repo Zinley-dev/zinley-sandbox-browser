@@ -4,7 +4,8 @@
  * screenshot): the page and its tabs, how much lies above/below the viewport,
  * load / dialog / PDF hints, the indexed interactive elements with new ones
  * marked `*[`, and a screenshot with the same indices drawn on it — done with
- * the engine's in-page overlay (addHighlights), so no sharp is needed.
+ * a small in-page overlay of our own (no sharp, and no function passed to
+ * page.evaluate: see drawIndexOverlay).
  *
  * Shared by the desktop app (BrowserUseManager.browserStep) and the Zinley's
  * Computer daemon. The two engine copies must stay identical.
@@ -14,7 +15,7 @@ import type { ActionRegistry, ActionContext } from './actions/registry.js';
 import { DEFAULT_INCLUDE_ATTRIBUTES } from './dom/views.js';
 
 export interface StepTab {
-	/** Last four characters of the target id — enough to `switch{tab_index}` by. */
+	/** Last four characters of the target id — enough to `switch{tab_id}` by. */
 	id: string;
 	url: string;
 	title: string;
@@ -104,26 +105,71 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		if (state.isPdfViewer) out.notes.push('This is a PDF viewer — extract cannot read it; scroll to read it, or download the file.');
 	}
 	if (wantShot) {
+		const page: any = session.getPageOrCurrent();
 		let highlighted = false;
 		if (opts.highlight !== false && selectorMap && selectorMap.size > 0) {
-			try {
-				await session.addHighlights(selectorMap);
-				highlighted = true;
-			} catch {
-				/* plain screenshot then */
-			}
+			highlighted = await drawIndexOverlay(page, selectorMap);
 		}
 		try {
-			const page: any = session.getPageOrCurrent();
 			const buf: Buffer = await page.screenshot({ type: 'jpeg', quality: opts.jpegQuality ?? 60, timeout: 15000 });
 			out.screenshot = buf.toString('base64');
 			out.screenshotMime = 'image/jpeg';
 		} catch (err: any) {
 			out.notes.push(`Screenshot failed (${String(err?.message || err).slice(0, 80)}).`);
 		}
-		if (highlighted) await session.removeHighlights().catch(() => undefined);
+		if (highlighted) await page.evaluate(REMOVE_OVERLAY_SCRIPT).catch(() => undefined);
 	}
 	return out;
+}
+
+const OVERLAY_ID = 'zinley-step-index-overlay';
+/** Passed to page.evaluate as a STRING on purpose: a bundler that keeps
+ *  function names (esbuild keepNames / tsx) rewrites a function's source with
+ *  `__name(...)` helpers that do not exist inside the page — the engine's own
+ *  addHighlights fails exactly that way under such builds. */
+const REMOVE_OVERLAY_SCRIPT = `(() => { const c = document.getElementById(${JSON.stringify(OVERLAY_ID)}); if (c) c.remove(); })()`;
+
+/** Draw the `[index]` boxes and labels over the interactive elements — the
+ *  same numbers the element list uses — using the page's own DOM. */
+async function drawIndexOverlay(page: any, selectorMap: Map<number, any>): Promise<boolean> {
+	const boxes: Array<{ i: number; x: number; y: number; w: number; h: number; t: string }> = [];
+	for (const [index, node] of selectorMap.entries()) {
+		const p = node?.absolutePosition || node?.snapshotNode?.bounds;
+		if (!p || !(p.width > 0) || !(p.height > 0)) continue;
+		boxes.push({ i: index, x: p.x, y: p.y, w: p.width, h: p.height, t: String(node?.nodeName || node?.tagName || '').toLowerCase() });
+	}
+	if (boxes.length === 0) return false;
+	const script = `(() => {
+		const data = ${JSON.stringify(boxes)};
+		const id = ${JSON.stringify(OVERLAY_ID)};
+		const old = document.getElementById(id); if (old) old.remove();
+		const sx = window.scrollX, sy = window.scrollY, vw = window.innerWidth, vh = window.innerHeight;
+		const root = document.createElement('div');
+		root.id = id;
+		root.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
+		const colors = { a: '#2563eb', button: '#dc2626', input: '#059669', textarea: '#059669', select: '#7c3aed' };
+		for (const b of data) {
+			const x = b.x - sx, y = b.y - sy;
+			if (x + b.w < 0 || y + b.h < 0 || x > vw || y > vh) continue;
+			const c = colors[b.t] || '#ea580c';
+			const box = document.createElement('div');
+			box.style.cssText = 'position:fixed;box-sizing:border-box;border:2px solid ' + c + ';background:' + c + '14;left:' + x + 'px;top:' + y + 'px;width:' + b.w + 'px;height:' + b.h + 'px;';
+			const label = document.createElement('div');
+			label.textContent = String(b.i);
+			const above = y >= 14;
+			label.style.cssText = 'position:absolute;left:0;' + (above ? 'top:-14px;' : 'top:0;') + 'padding:0 3px;font:bold 11px/14px system-ui,Arial,sans-serif;color:#fff;background:' + c + ';border-radius:2px;white-space:nowrap;';
+			box.appendChild(label);
+			root.appendChild(box);
+		}
+		document.documentElement.appendChild(root);
+		return root.childElementCount;
+	})()`;
+	try {
+		const drawn = await page.evaluate(script);
+		return Number(drawn) > 0;
+	} catch {
+		return false;
+	}
 }
 
 /** The text block the chat model reads — the same ingredients as the agent's <browser_state>. */
