@@ -55225,6 +55225,129 @@ var ChatSnowX = class {
   }
 };
 
+// sandbox-runtime/browser-use-engine/step-state.ts
+init_views();
+async function captureStepState(session, opts = {}) {
+  const wantShot = opts.screenshot !== false;
+  const maxChars = opts.maxElementsChars ?? 12e3;
+  const out = {
+    url: "",
+    title: "",
+    tabs: [],
+    elements: "",
+    elementsTruncated: false,
+    interactiveCount: 0,
+    pageInfo: "",
+    notes: [],
+    screenshot: null
+  };
+  let state = null;
+  try {
+    state = await session.getState({ includeScreenshot: false, includeDom: true, includeRecentEvents: false });
+  } catch (err) {
+    out.notes.push(`Page state could not be captured (${String(err?.message || err).slice(0, 120)}) \u2014 the page may be mid-navigation; wait a second and look again.`);
+    try {
+      out.url = await session.getCurrentPageUrl();
+      out.title = await session.getCurrentPageTitle();
+    } catch {
+    }
+  }
+  let selectorMap;
+  if (state) {
+    out.url = state.url || "";
+    out.title = state.title || "";
+    const currentId = String(session.getCurrentPageId?.() || "");
+    out.tabs = (state.tabs || []).map((t2) => {
+      const full = String(t2.targetId || t2.id || "");
+      return { id: full.slice(-4), url: String(t2.url || ""), title: String(t2.title || ""), active: full === currentId };
+    });
+    selectorMap = state.domState?.selectorMap;
+    out.interactiveCount = selectorMap?.size ?? 0;
+    let elements = state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "";
+    const pi = state.pageInfo;
+    let above = false;
+    let below = false;
+    if (pi && pi.viewportHeight > 0) {
+      const pagesAbove = pi.pixelsAbove / pi.viewportHeight;
+      const pagesBelow = pi.pixelsBelow / pi.viewportHeight;
+      above = pagesAbove > 0;
+      below = pagesBelow > 0;
+      out.pageInfo = `${pagesAbove.toFixed(1)} pages above, ${pagesBelow.toFixed(1)} pages below` + (pagesBelow > 0.2 ? " \u2014 scroll down to reveal more content" : "");
+    }
+    if (elements) {
+      if (!above) elements = `[Start of page]
+${elements}`;
+      if (!below) elements = `${elements}
+[End of page]`;
+    } else {
+      elements = "empty page";
+    }
+    if (elements.length > maxChars) {
+      elements = `${elements.slice(0, maxChars)}
+\u2026 (${elements.length - maxChars} more chars; scroll or narrow the page)`;
+      out.elementsTruncated = true;
+    }
+    out.elements = elements;
+    if (Array.isArray(state.closedPopupMessages) && state.closedPopupMessages.length > 0) {
+      out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(" | ")}`);
+    }
+    if (state.stateError) out.notes.push(String(state.stateError));
+    if (state.isPdfViewer) out.notes.push("This is a PDF viewer \u2014 extract cannot read it; scroll to read it, or download the file.");
+  }
+  if (wantShot) {
+    let highlighted = false;
+    if (opts.highlight !== false && selectorMap && selectorMap.size > 0) {
+      try {
+        await session.addHighlights(selectorMap);
+        highlighted = true;
+      } catch {
+      }
+    }
+    try {
+      const page = session.getPageOrCurrent();
+      const buf = await page.screenshot({ type: "jpeg", quality: opts.jpegQuality ?? 60, timeout: 15e3 });
+      out.screenshot = buf.toString("base64");
+      out.screenshotMime = "image/jpeg";
+    } catch (err) {
+      out.notes.push(`Screenshot failed (${String(err?.message || err).slice(0, 80)}).`);
+    }
+    if (highlighted) await session.removeHighlights().catch(() => void 0);
+  }
+  return out;
+}
+async function runStepActions(session, registry, actions, context, opts = {}) {
+  const max = opts.max ?? 5;
+  const results = [];
+  let interrupted;
+  const urlBefore = await session.getCurrentPageUrl().catch(() => "");
+  for (let i2 = 0; i2 < Math.min(actions.length, max); i2++) {
+    const { action, params } = actions[i2];
+    if (!registry.getAction(action)) {
+      results.push({ action, ok: false, error: `Unknown action '${action}'. Available: ${[...registry.getActions().keys()].join(", ")}` });
+      break;
+    }
+    try {
+      const r2 = await registry.execute(action, params ?? {}, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+      const message = [r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n") || void 0;
+      results.push({ action, ok: !r2.error, message, error: r2.error || void 0 });
+      if (r2.error) break;
+    } catch (err) {
+      const msg = err?.issues ? `Invalid params: ${JSON.stringify(err.issues)}` : String(err?.message || err);
+      results.push({ action, ok: false, error: msg });
+      break;
+    }
+    if (i2 < actions.length - 1) {
+      const urlAfter = await session.getCurrentPageUrl().catch(() => "");
+      if (urlAfter && urlBefore && urlAfter !== urlBefore) {
+        interrupted = `The page changed after '${action}' (${urlAfter}); the remaining ${actions.length - i2 - 1} action(s) were not run \u2014 look at the new page first.`;
+        break;
+      }
+    }
+  }
+  if (actions.length > max) interrupted = interrupted ?? `Only the first ${max} actions were run.`;
+  return { ok: results.length > 0 && results.every((r2) => r2.ok), results, interrupted };
+}
+
 // src/services/sandbox-browser/protocol.ts
 var ZB_DAEMON_PORT = 7331;
 var ZB_STATE_DIR = ".zinley";
@@ -55237,7 +55360,7 @@ var ZB_DEPS_DIR = `${ZB_STATE_DIR}/rt`;
 var ZB_LOG_FILE = `${ZB_STATE_DIR}/zbrowser.log`;
 
 // sandbox-runtime/zbrowser/src/daemon.ts
-var VERSION2 = true ? "2026-09-15-ec970e4" : "dev";
+var VERSION2 = true ? "2026-09-17-ec970e4" : "dev";
 var WORKSPACE = process.env.ZB_WORKSPACE || path10.join(os4.homedir(), "workspace");
 var PROFILE_DIR = path10.join(WORKSPACE, ZB_PROFILE_DIR);
 var DOWNLOADS_DIR = path10.join(WORKSPACE, ZB_DOWNLOADS_DIR);
@@ -55393,46 +55516,50 @@ var Daemon = class {
       return null;
     }
   }
+  /** The page as the agent's model would see it (see engine step-state.ts):
+   *  tabs, viewport position, hints, `*[`-marked elements, numbered screenshot. */
   async browserState(session, includeScreenshot, inlineScreenshot = false) {
-    let url = "";
-    let title = "";
-    let elements = "";
-    let tabs = [];
-    try {
-      const state = await session.getState({ includeScreenshot: false, includeDom: true, includeRecentEvents: false });
-      url = state?.url || "";
-      title = state?.title || "";
-      elements = state?.domState?.llmRepresentation?.([]) ?? "";
-      const currentId = session.getCurrentPageId?.();
-      tabs = (state?.tabs || []).map((t2) => ({
-        id: String(t2.targetId || t2.id || ""),
-        url: String(t2.url || ""),
-        title: String(t2.title || ""),
-        active: String(t2.targetId || t2.id || "") === String(currentId || "")
-      }));
-    } catch (err) {
-      log(`getState failed: ${err?.message}`);
-      try {
-        url = await session.getCurrentPageUrl();
-        title = await session.getCurrentPageTitle();
-      } catch {
-      }
+    const st2 = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+    let screenshotPath;
+    let screenshot2 = null;
+    if (st2.screenshot) {
+      if (inlineScreenshot) screenshot2 = st2.screenshot;
+      else screenshotPath = this.writeShot(Buffer.from(st2.screenshot, "base64"));
     }
-    const elementsTruncated = elements.length > MAX_ELEMENTS_CHARS;
-    if (elementsTruncated) elements = `${elements.slice(0, MAX_ELEMENTS_CHARS)}
-\u2026 (${elements.length - MAX_ELEMENTS_CHARS} more chars; scroll or narrow the page)`;
-    const shot = includeScreenshot ? await this.screenshotJpeg(session, 60, inlineScreenshot) : null;
     return {
-      url,
-      title,
-      tabs,
-      elements,
-      elementsTruncated,
-      screenshot: shot?.base64 ?? null,
-      screenshotPath: shot?.path,
-      screenshotMime: shot ? "image/jpeg" : void 0,
+      url: st2.url,
+      title: st2.title,
+      tabs: st2.tabs.map((t2) => ({ id: t2.id, url: t2.url, title: t2.title, active: t2.active })),
+      elements: st2.elements,
+      elementsTruncated: st2.elementsTruncated,
+      interactiveCount: st2.interactiveCount,
+      pageInfo: st2.pageInfo,
+      notes: st2.notes,
+      screenshot: screenshot2,
+      screenshotPath,
+      screenshotMime: st2.screenshot ? "image/jpeg" : void 0,
       needsUser: this.task?.needsUser ?? null
     };
+  }
+  /** Persist a screenshot under the workspace (the backend downloads it over sandbox.fs). */
+  writeShot(buf) {
+    try {
+      fs11.mkdirSync(SHOTS_DIR, { recursive: true });
+      try {
+        const cutoff = Date.now() - 36e5;
+        for (const f2 of fs11.readdirSync(SHOTS_DIR)) {
+          const fp = path10.join(SHOTS_DIR, f2);
+          if (fs11.statSync(fp).mtimeMs < cutoff) fs11.unlinkSync(fp);
+        }
+      } catch {
+      }
+      const file = path10.join(SHOTS_DIR, `shot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}.jpg`);
+      fs11.writeFileSync(file, buf);
+      return file;
+    } catch (err) {
+      log(`screenshot write failed: ${err?.message}`);
+      return void 0;
+    }
   }
   ensureLlm() {
     if (!this.token) throw new Error("No API token configured (backend must pass token before starting a task).");
@@ -55450,30 +55577,37 @@ var Daemon = class {
       if (this.task?.agent) this.task.agent.llm = this.llm;
     }
   }
-  // ── single actions ──
-  async act(action, params, inlineScreenshot = false) {
+  // ── single actions / short batches ──
+  async act(action, params, inlineScreenshot = false, batch) {
     const session = await this.ensureBrowser();
+    const actions = batch && batch.length > 0 ? batch : [{ action, params }];
+    const label = actions.map((a2) => a2.action).join(" \u2192 ");
     if (this.task && this.task.status === "running") {
-      return { ok: false, action, error: "An autonomous task is running. Stop or pause it before driving the browser directly." };
+      return { ok: false, action: label, error: "An autonomous task is running. Stop or pause it before driving the browser directly." };
     }
-    if (!this.registry.getAction(action)) {
-      const names = [...this.registry.getActions().keys()].filter((n2) => n2 !== "done" && n2 !== "request_user_help");
-      return { ok: false, action, error: `Unknown action '${action}'. Available: ${names.join(", ")}` };
+    for (const a2 of actions) {
+      if (a2.action === "done" || a2.action === "request_user_help") {
+        return { ok: false, action: label, error: `'${a2.action}' is the browser agent's, not a step \u2014 use op="handoff" for the user and just stop calling when you are done.` };
+      }
     }
     const context = {
       browserSession: session,
       llm: this.token ? this.ensureLlm() : void 0,
       pageExtractionLlm: this.token ? this.ensureLlm() : void 0
     };
-    try {
-      const result = await this.registry.execute(action, params, context, { actionTimeoutS: 60 });
-      const state = await this.browserState(session, true, inlineScreenshot);
-      const message = [result.extractedContent, result.longTermMemory].filter(Boolean).join("\n");
-      return { ok: !result.error, action, message: message || void 0, error: result.error || void 0, state };
-    } catch (err) {
-      const msg = err?.issues ? `Invalid params: ${JSON.stringify(err.issues)}` : String(err?.message || err);
-      return { ok: false, action, error: msg };
-    }
+    const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
+    const state = await this.browserState(session, true, inlineScreenshot);
+    const messages = run.results.map((r2) => r2.ok ? r2.message : `${r2.action} failed: ${r2.error}`).filter(Boolean).join("\n");
+    const failed = run.results.find((r2) => !r2.ok);
+    return {
+      ok: run.ok,
+      action: label,
+      message: messages || void 0,
+      error: failed?.error,
+      state,
+      results: run.results,
+      interrupted: run.interrupted
+    };
   }
   // ── autonomous task ──
   async startTask(input) {
@@ -55642,7 +55776,9 @@ var Daemon = class {
           if (body?.url && typeof body.url === "string") {
             await session.navigate(body.url);
           }
-          return this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          state.actionsHelp = this.registry.getPromptDescription(state.url || void 0).split("\n").filter((line) => !/^(?:done|request_user_help|write_file|read_file|replace_file|screenshot|save_as_pdf):/.test(line)).join("\n");
+          return state;
         });
       case "browser/state":
         return this.serialized(async () => this.browserState(await this.ensureBrowser(), body?.screenshot !== false, body?.inline === true));
@@ -55653,9 +55789,13 @@ var Daemon = class {
           const shot = await this.screenshotJpeg(session, quality, body?.inline === true);
           return { screenshot: shot?.base64 ?? null, screenshotPath: shot?.path, mime: "image/jpeg", url: await session.getCurrentPageUrl().catch(() => "") };
         });
-      case "browser/act":
-        if (!body?.action || typeof body.action !== "string") throw new Error("action is required");
-        return this.serialized(() => this.act(body.action, body.params && typeof body.params === "object" ? body.params : {}, body?.inline === true));
+      case "browser/act": {
+        const batch = Array.isArray(body?.actions) ? body.actions.filter((a2) => a2 && typeof a2.action === "string" && a2.action.trim()).map((a2) => ({ action: String(a2.action).trim(), params: a2.params && typeof a2.params === "object" ? a2.params : {} })) : void 0;
+        if ((!batch || batch.length === 0) && (!body?.action || typeof body.action !== "string")) throw new Error("action (or actions[]) is required");
+        return this.serialized(
+          () => this.act(String(body?.action || batch[0].action), body?.params && typeof body.params === "object" ? body.params : {}, body?.inline === true, batch)
+        );
+      }
       case "browser/close":
         await this.stopTask();
         await this.closeBrowser();

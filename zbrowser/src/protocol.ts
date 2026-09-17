@@ -83,9 +83,19 @@ export interface ZbBrowserState {
   url: string;
   title: string;
   tabs: ZbTabInfo[];
-  /** Indexed interactive elements in the engine's `[index]<tag>text</tag>` form. */
+  /** Indexed interactive elements in the engine's `[index]<tag>text</tag>` form;
+   *  `*[` marks one new since the last step, `[Start of page]`/`[End of page]`
+   *  frame it when nothing lies above/below the viewport. */
   elements: string;
   elementsTruncated: boolean;
+  /** Runtime ≥ v1.0.2: number of interactive elements the indices cover. */
+  interactiveCount?: number;
+  /** Runtime ≥ v1.0.2: "0.0 pages above, 2.3 pages below — scroll down to reveal more content". */
+  pageInfo?: string;
+  /** Runtime ≥ v1.0.2: hints the agent's model gets too (auto-closed dialogs, PDF viewer, capture errors). */
+  notes?: string[];
+  /** Runtime ≥ v1.0.2, `browser/open` only: the engine's own reference of every action and its parameters. */
+  actionsHelp?: string;
   /** Inline base64 only when requested (`inline:true`); normally the daemon
    *  writes the JPEG under the workspace and returns `screenshotPath`. */
   screenshot?: string | null;
@@ -100,6 +110,10 @@ export interface ZbActResult {
   message?: string;
   error?: string;
   state?: ZbBrowserState;
+  /** Runtime ≥ v1.0.2: one entry per action when a batch was sent (`actions`). */
+  results?: Array<{ action: string; ok: boolean; message?: string; error?: string }>;
+  /** Runtime ≥ v1.0.2: why later actions of the batch were not run. */
+  interrupted?: string;
 }
 
 export type ZbEndpoint =
@@ -193,4 +207,32 @@ export function stripHandoffLine(text: string): string {
     .replace(new RegExp(`^${ZB_HANDOFF_MARKER} \\{.*\\}\\s*$`, 'gm'), '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * `browser_live` — streamed to the chat client (SSE chunk, alongside `text`
+ * chunks) whenever the agent drives the browser on Zinley's Computer, so the
+ * user can watch and step in at any time — never left to the model's judgement.
+ * One card per `liveId`; every event replaces the previous state. `screenshot`
+ * is a small inline JPEG data URL (≤ ~60 KB) or absent when unchanged.
+ */
+export interface BrowserLiveEvent {
+  type: 'browser_live';
+  v: 1;
+  /** Stable for one browser session on one sandbox (sandbox id + link). */
+  liveId: string;
+  conversationId?: string;
+  status: 'running' | 'needs_user' | 'ended';
+  /** Two-or-three-word deterministic label: "Opening page", "Clicking", "Finished". */
+  step: string;
+  pageUrl?: string;
+  pageTitle?: string;
+  screenshot?: string;
+  /** Interactive live view (same link as the takeover card). https only. */
+  viewUrl: string;
+  expiresAt: string;
+  /** Only with status 'needs_user'. */
+  reason?: string;
+  whatToDo?: string;
+  at: number;
 }

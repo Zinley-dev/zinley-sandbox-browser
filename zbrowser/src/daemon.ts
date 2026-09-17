@@ -33,6 +33,7 @@ import { ActionRegistry, type ActionContext } from '../../browser-use-engine/act
 import { registerBuiltinActions } from '../../browser-use-engine/actions/builtin.js';
 import { ChatSnowX } from '../../browser-use-engine/llm/snowx/chat.js';
 import type { ActionResult } from '../../browser-use-engine/types/agent.js';
+import { captureStepState, runStepActions, type StepAction } from '../../browser-use-engine/step-state.js';
 
 import {
   ZB_DAEMON_PORT,
@@ -241,46 +242,52 @@ class Daemon {
     }
   }
 
+  /** The page as the agent's model would see it (see engine step-state.ts):
+   *  tabs, viewport position, hints, `*[`-marked elements, numbered screenshot. */
   async browserState(session: BrowserSession, includeScreenshot: boolean, inlineScreenshot = false): Promise<ZbBrowserState> {
-    let url = '';
-    let title = '';
-    let elements = '';
-    let tabs: ZbTabInfo[] = [];
-    try {
-      const state: any = await session.getState({ includeScreenshot: false, includeDom: true, includeRecentEvents: false });
-      url = state?.url || '';
-      title = state?.title || '';
-      elements = state?.domState?.llmRepresentation?.([]) ?? '';
-      const currentId = session.getCurrentPageId?.();
-      tabs = (state?.tabs || []).map((t: any) => ({
-        id: String(t.targetId || t.id || ''),
-        url: String(t.url || ''),
-        title: String(t.title || ''),
-        active: String(t.targetId || t.id || '') === String(currentId || ''),
-      }));
-    } catch (err: any) {
-      log(`getState failed: ${err?.message}`);
-      try {
-        url = await session.getCurrentPageUrl();
-        title = await session.getCurrentPageTitle();
-      } catch {
-        /* keep empty */
-      }
+    const st = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+    let screenshotPath: string | undefined;
+    let screenshot: string | null = null;
+    if (st.screenshot) {
+      if (inlineScreenshot) screenshot = st.screenshot;
+      else screenshotPath = this.writeShot(Buffer.from(st.screenshot, 'base64'));
     }
-    const elementsTruncated = elements.length > MAX_ELEMENTS_CHARS;
-    if (elementsTruncated) elements = `${elements.slice(0, MAX_ELEMENTS_CHARS)}\n… (${elements.length - MAX_ELEMENTS_CHARS} more chars; scroll or narrow the page)`;
-    const shot = includeScreenshot ? await this.screenshotJpeg(session, 60, inlineScreenshot) : null;
     return {
-      url,
-      title,
-      tabs,
-      elements,
-      elementsTruncated,
-      screenshot: shot?.base64 ?? null,
-      screenshotPath: shot?.path,
-      screenshotMime: shot ? 'image/jpeg' : undefined,
+      url: st.url,
+      title: st.title,
+      tabs: st.tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active })),
+      elements: st.elements,
+      elementsTruncated: st.elementsTruncated,
+      interactiveCount: st.interactiveCount,
+      pageInfo: st.pageInfo,
+      notes: st.notes,
+      screenshot,
+      screenshotPath,
+      screenshotMime: st.screenshot ? 'image/jpeg' : undefined,
       needsUser: this.task?.needsUser ?? null,
     };
+  }
+
+  /** Persist a screenshot under the workspace (the backend downloads it over sandbox.fs). */
+  private writeShot(buf: Buffer): string | undefined {
+    try {
+      fs.mkdirSync(SHOTS_DIR, { recursive: true });
+      try {
+        const cutoff = Date.now() - 3600_000;
+        for (const f of fs.readdirSync(SHOTS_DIR)) {
+          const fp = path.join(SHOTS_DIR, f);
+          if (fs.statSync(fp).mtimeMs < cutoff) fs.unlinkSync(fp);
+        }
+      } catch {
+        /* best effort */
+      }
+      const file = path.join(SHOTS_DIR, `shot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}.jpg`);
+      fs.writeFileSync(file, buf);
+      return file;
+    } catch (err: any) {
+      log(`screenshot write failed: ${err?.message}`);
+      return undefined;
+    }
   }
 
   private ensureLlm(): ChatSnowX {
@@ -301,30 +308,37 @@ class Daemon {
     }
   }
 
-  // ── single actions ──
-  async act(action: string, params: Record<string, unknown>, inlineScreenshot = false): Promise<ZbActResult> {
+  // ── single actions / short batches ──
+  async act(action: string, params: Record<string, unknown>, inlineScreenshot = false, batch?: StepAction[]): Promise<ZbActResult> {
     const session = await this.ensureBrowser();
+    const actions: StepAction[] = batch && batch.length > 0 ? batch : [{ action, params }];
+    const label = actions.map(a => a.action).join(' → ');
     if (this.task && this.task.status === 'running') {
-      return { ok: false, action, error: 'An autonomous task is running. Stop or pause it before driving the browser directly.' };
+      return { ok: false, action: label, error: 'An autonomous task is running. Stop or pause it before driving the browser directly.' };
     }
-    if (!this.registry.getAction(action)) {
-      const names = [...this.registry.getActions().keys()].filter(n => n !== 'done' && n !== 'request_user_help');
-      return { ok: false, action, error: `Unknown action '${action}'. Available: ${names.join(', ')}` };
+    for (const a of actions) {
+      if (a.action === 'done' || a.action === 'request_user_help') {
+        return { ok: false, action: label, error: `'${a.action}' is the browser agent's, not a step — use op="handoff" for the user and just stop calling when you are done.` };
+      }
     }
     const context: ActionContext = {
       browserSession: session,
       llm: this.token ? this.ensureLlm() : undefined,
       pageExtractionLlm: this.token ? this.ensureLlm() : undefined,
     } as ActionContext;
-    try {
-      const result = await this.registry.execute(action, params, context, { actionTimeoutS: 60 });
-      const state = await this.browserState(session, true, inlineScreenshot);
-      const message = [result.extractedContent, result.longTermMemory].filter(Boolean).join('\n');
-      return { ok: !result.error, action, message: message || undefined, error: result.error || undefined, state };
-    } catch (err: any) {
-      const msg = err?.issues ? `Invalid params: ${JSON.stringify(err.issues)}` : String(err?.message || err);
-      return { ok: false, action, error: msg };
-    }
+    const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
+    const state = await this.browserState(session, true, inlineScreenshot);
+    const messages = run.results.map(r => (r.ok ? r.message : `${r.action} failed: ${r.error}`)).filter(Boolean).join('\n');
+    const failed = run.results.find(r => !r.ok);
+    return {
+      ok: run.ok,
+      action: label,
+      message: messages || undefined,
+      error: failed?.error,
+      state,
+      results: run.results,
+      interrupted: run.interrupted,
+    };
   }
 
   // ── autonomous task ──
@@ -515,7 +529,15 @@ class Daemon {
           if (body?.url && typeof body.url === 'string') {
             await session.navigate(body.url);
           }
-          return this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          // The engine's own action reference — the exact parameters the agent's
+          // model gets — minus the agent-loop-only actions.
+          state.actionsHelp = this.registry
+            .getPromptDescription(state.url || undefined)
+            .split('\n')
+            .filter(line => !/^(?:done|request_user_help|write_file|read_file|replace_file|screenshot|save_as_pdf):/.test(line))
+            .join('\n');
+          return state;
         });
       case 'browser/state':
         return this.serialized(async () => this.browserState(await this.ensureBrowser(), body?.screenshot !== false, body?.inline === true));
@@ -526,9 +548,17 @@ class Daemon {
           const shot = await this.screenshotJpeg(session, quality, body?.inline === true);
           return { screenshot: shot?.base64 ?? null, screenshotPath: shot?.path, mime: 'image/jpeg', url: await session.getCurrentPageUrl().catch(() => '') };
         });
-      case 'browser/act':
-        if (!body?.action || typeof body.action !== 'string') throw new Error('action is required');
-        return this.serialized(() => this.act(body.action, body.params && typeof body.params === 'object' ? body.params : {}, body?.inline === true));
+      case 'browser/act': {
+        const batch: StepAction[] | undefined = Array.isArray(body?.actions)
+          ? body.actions
+              .filter((a: any) => a && typeof a.action === 'string' && a.action.trim())
+              .map((a: any) => ({ action: String(a.action).trim(), params: a.params && typeof a.params === 'object' ? a.params : {} }))
+          : undefined;
+        if ((!batch || batch.length === 0) && (!body?.action || typeof body.action !== 'string')) throw new Error('action (or actions[]) is required');
+        return this.serialized(() =>
+          this.act(String(body?.action || batch![0].action), body?.params && typeof body.params === 'object' ? body.params : {}, body?.inline === true, batch),
+        );
+      }
       case 'browser/close':
         await this.stopTask();
         await this.closeBrowser();
