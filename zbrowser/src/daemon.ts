@@ -327,7 +327,17 @@ class Daemon {
       pageExtractionLlm: this.token ? this.ensureLlm() : undefined,
     } as ActionContext;
     const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
-    const state = await this.browserState(session, true, inlineScreenshot);
+    // What ran must reach the model even when the page cannot be read afterwards
+    // (the site closed the tab, Chrome died): the results are the record of a
+    // submit that DID happen.
+    let state: ZbBrowserState | undefined;
+    let stateError: string | undefined;
+    try {
+      state = await this.browserState(session, true, inlineScreenshot);
+    } catch (err: any) {
+      stateError = `The page could not be read after the action(s) (${String(err?.message || err).slice(0, 120)}) — op="state" to look again.`;
+      log(`act: state capture failed: ${err?.message}`);
+    }
     const messages = run.results.map(r => (r.ok ? r.message : `${r.action} failed: ${r.error}`)).filter(Boolean).join('\n');
     const failed = run.results.find(r => !r.ok);
     return {
@@ -337,7 +347,7 @@ class Daemon {
       error: failed?.error,
       state,
       results: run.results,
-      interrupted: run.interrupted,
+      interrupted: [run.interrupted, stateError].filter(Boolean).join(' ') || undefined,
     };
   }
 
@@ -526,14 +536,23 @@ class Daemon {
       case 'browser/open':
         return this.serialized(async () => {
           const session = await this.ensureBrowser();
+          // A navigation that times out still leaves a page (often the right
+          // one, still loading): report it as a note and show what is there.
+          let navError: string | undefined;
           if (body?.url && typeof body.url === 'string') {
-            await session.navigate(body.url);
+            try {
+              await session.navigate(body.url);
+            } catch (err: any) {
+              navError = `Opening ${body.url} did not complete (${String(err?.message || err).slice(0, 100)}) — the page below is what the browser shows now.`;
+            }
           }
           const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          if (navError) state.notes = [navError, ...(state.notes ?? [])];
           // The engine's own action reference — the exact parameters the agent's
-          // model gets — minus the agent-loop-only actions.
+          // model gets — minus the agent-loop-only actions. No URL: with one the
+          // registry keeps only domain-scoped actions, and no builtin has a domain.
           state.actionsHelp = this.registry
-            .getPromptDescription(state.url || undefined)
+            .getPromptDescription()
             .split('\n')
             .filter(line => !/^(?:done|request_user_help|write_file|read_file|replace_file|screenshot|save_as_pdf):/.test(line))
             .join('\n');
@@ -555,14 +574,19 @@ class Daemon {
               .map((a: any) => ({ action: String(a.action).trim(), params: a.params && typeof a.params === 'object' ? a.params : {} }))
           : undefined;
         if ((!batch || batch.length === 0) && (!body?.action || typeof body.action !== 'string')) throw new Error('action (or actions[]) is required');
+        // `extract` reads the page with a model: the backend sends the user's
+        // token with the step that needs it (a task start is the other source).
+        if (typeof body?.token === 'string' && body.token) this.setToken(body.token, body.model, body.proxyBase);
         return this.serialized(() =>
           this.act(String(body?.action || batch![0].action), body?.params && typeof body.params === 'object' ? body.params : {}, body?.inline === true, batch),
         );
       }
       case 'browser/close':
-        await this.stopTask();
-        await this.closeBrowser();
-        return { closed: true };
+        return this.serialized(async () => {
+          await this.stopTask();
+          await this.closeBrowser();
+          return { closed: true };
+        });
       case 'task/start':
         if (!body?.task || typeof body.task !== 'string') throw new Error('task is required');
         return this.startTask(body);

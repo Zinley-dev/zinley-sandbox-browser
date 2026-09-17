@@ -55243,7 +55243,7 @@ async function captureStepState(session, opts = {}) {
   };
   let state = null;
   try {
-    state = await session.getState({ includeScreenshot: false, includeDom: true, includeRecentEvents: false });
+    state = await getStateWithPage(session);
   } catch (err) {
     out.notes.push(`Page state could not be captured (${String(err?.message || err).slice(0, 120)}) \u2014 the page may be mid-navigation; wait a second and look again.`);
     try {
@@ -55263,7 +55263,7 @@ async function captureStepState(session, opts = {}) {
     });
     selectorMap = state.domState?.selectorMap;
     out.interactiveCount = selectorMap?.size ?? 0;
-    let elements = state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "";
+    let elements = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "", selectorMap);
     const pi = state.pageInfo;
     let above = false;
     let below = false;
@@ -55283,8 +55283,10 @@ ${elements}`;
       elements = "empty page";
     }
     if (elements.length > maxChars) {
-      elements = `${elements.slice(0, maxChars)}
-\u2026 (${elements.length - maxChars} more chars; scroll or narrow the page)`;
+      const nl = elements.lastIndexOf("\n", maxChars);
+      const keep = nl > maxChars / 2 ? nl : maxChars;
+      elements = `${elements.slice(0, keep)}
+\u2026 (${elements.length - keep} more chars not shown; scroll or narrow the page)`;
       out.elementsTruncated = true;
     }
     out.elements = elements;
@@ -55295,12 +55297,17 @@ ${elements}`;
     if (state.isPdfViewer) out.notes.push("This is a PDF viewer \u2014 extract cannot read it; scroll to read it, or download the file.");
   }
   if (wantShot) {
-    const page = session.getPageOrCurrent();
-    let highlighted = false;
-    if (opts.highlight !== false && selectorMap && selectorMap.size > 0) {
-      highlighted = await drawIndexOverlay(page, selectorMap);
-    }
+    let page = null;
     try {
+      page = session.getPageOrCurrent();
+    } catch (err) {
+      out.notes.push(`Screenshot skipped (${String(err?.message || err).slice(0, 80)}).`);
+    }
+    let highlighted = false;
+    if (page && opts.highlight !== false && selectorMap && selectorMap.size > 0) {
+      highlighted = await drawIndexOverlay(page, selectorMap, out.elementsTruncated ? indicesIn(out.elements) : void 0);
+    }
+    if (page) try {
       const buf = await page.screenshot({ type: "jpeg", quality: opts.jpegQuality ?? 50, scale: "css", timeout: 15e3 });
       out.screenshot = buf.toString("base64");
       out.screenshotMime = "image/jpeg";
@@ -55311,11 +55318,49 @@ ${elements}`;
   }
   return out;
 }
+var STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false };
+async function getStateWithPage(session) {
+  try {
+    return await session.getState(STATE_OPTS);
+  } catch (err) {
+    const ensure = session.ensurePage;
+    if (/no active page/i.test(String(err?.message || err)) && typeof ensure === "function") {
+      await ensure.call(session);
+      return await session.getState(STATE_OPTS);
+    }
+    throw err;
+  }
+}
+var lastSeen = /* @__PURE__ */ new WeakMap();
+var INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
+function markNewElements(session, url, elements, selectorMap) {
+  const ids = /* @__PURE__ */ new Set();
+  if (selectorMap) {
+    for (const node of selectorMap.values()) {
+      const id = Number(node?.backendNodeId);
+      if (Number.isFinite(id)) ids.add(id);
+    }
+  }
+  const prev = lastSeen.get(session);
+  lastSeen.set(session, { url, ids });
+  const samePage = !!prev && prev.url === url && prev.ids.size > 0;
+  return elements.replace(INDEX_LINE, (_m, indent, idx) => {
+    const id = Number(selectorMap?.get(Number(idx))?.backendNodeId);
+    const isNew = samePage && Number.isFinite(id) && !prev.ids.has(id);
+    return `${indent}${isNew ? "*" : ""}[${idx}]`;
+  });
+}
+function indicesIn(elements) {
+  const out = /* @__PURE__ */ new Set();
+  for (const m2 of elements.matchAll(INDEX_LINE)) out.add(Number(m2[2]));
+  return out;
+}
 var OVERLAY_ID = "zinley-step-index-overlay";
 var REMOVE_OVERLAY_SCRIPT = `(() => { const c = document.getElementById(${JSON.stringify(OVERLAY_ID)}); if (c) c.remove(); })()`;
-async function drawIndexOverlay(page, selectorMap) {
+async function drawIndexOverlay(page, selectorMap, only) {
   const boxes = [];
   for (const [index, node] of selectorMap.entries()) {
+    if (only && !only.has(index)) continue;
     const vp = node?.absolutePosition;
     const p2 = vp || node?.snapshotNode?.bounds;
     if (!p2 || !(p2.width > 0) || !(p2.height > 0)) continue;
@@ -55359,33 +55404,55 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
   const results = [];
   let interrupted;
   const urlBefore = await session.getCurrentPageUrl().catch(() => "");
-  for (let i2 = 0; i2 < Math.min(actions.length, max); i2++) {
+  const planned = Math.min(actions.length, max);
+  const notRun = (i2) => i2 < planned - 1 ? ` The remaining ${planned - i2 - 1} action(s) were not run.` : "";
+  for (let i2 = 0; i2 < planned; i2++) {
     const { action, params } = actions[i2];
     if (!registry.getAction(action)) {
       results.push({ action, ok: false, error: `Unknown action '${action}'. Available: ${[...registry.getActions().keys()].join(", ")}` });
+      interrupted = notRun(i2).trim() || void 0;
       break;
     }
     try {
       const r2 = await registry.execute(action, params ?? {}, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
-      const message = [r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n") || void 0;
-      results.push({ action, ok: !r2.error, message, error: r2.error || void 0 });
-      if (r2.error) break;
+      const gone = !r2.error && typeof r2.extractedContent === "string" && /^Element index \d+ not available/.test(r2.extractedContent);
+      const error = r2.error || (gone ? String(r2.extractedContent) : void 0);
+      const message = error ? void 0 : [r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n") || void 0;
+      results.push({ action, ok: !error, message, error });
+      if (error) {
+        interrupted = notRun(i2).trim() || void 0;
+        break;
+      }
     } catch (err) {
       const msg = err?.issues ? `Invalid params: ${JSON.stringify(err.issues)}` : String(err?.message || err);
       results.push({ action, ok: false, error: msg });
+      interrupted = notRun(i2).trim() || void 0;
       break;
     }
-    if (i2 < actions.length - 1) {
+    if (i2 < planned - 1) {
+      if (typeof registry.terminatesSequence === "function" && registry.terminatesSequence(action)) {
+        interrupted = `'${action}' changes the page or tab, so the indices you chose no longer apply;${notRun(i2)} Look at the page first.`;
+        break;
+      }
+      await settleBetweenActions(session);
       const urlAfter = await session.getCurrentPageUrl().catch(() => "");
       if (urlAfter && urlBefore && urlAfter !== urlBefore) {
-        interrupted = `The page changed after '${action}' (${urlAfter}); the remaining ${actions.length - i2 - 1} action(s) were not run \u2014 look at the new page first.`;
+        interrupted = `The page changed after '${action}' (${urlAfter});${notRun(i2)} Look at the new page first.`;
         break;
       }
     }
   }
-  if (actions.length > max) interrupted = interrupted ?? `Only the first ${max} actions were run.`;
+  if (actions.length > max && !interrupted) interrupted = `Only the first ${max} actions were run.`;
   if (results.some((r2) => r2.ok)) await settleAfterActions(session);
   return { ok: results.length > 0 && results.every((r2) => r2.ok), results, interrupted };
+}
+async function settleBetweenActions(session) {
+  try {
+    await new Promise((resolve2) => setTimeout(resolve2, 300));
+    const page = session.getPageOrCurrent();
+    await page.waitForLoadState("domcontentloaded", { timeout: 1500 }).catch(() => void 0);
+  } catch {
+  }
 }
 async function settleAfterActions(session) {
   try {
@@ -55646,7 +55713,14 @@ var Daemon = class {
       pageExtractionLlm: this.token ? this.ensureLlm() : void 0
     };
     const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
-    const state = await this.browserState(session, true, inlineScreenshot);
+    let state;
+    let stateError;
+    try {
+      state = await this.browserState(session, true, inlineScreenshot);
+    } catch (err) {
+      stateError = `The page could not be read after the action(s) (${String(err?.message || err).slice(0, 120)}) \u2014 op="state" to look again.`;
+      log(`act: state capture failed: ${err?.message}`);
+    }
     const messages = run.results.map((r2) => r2.ok ? r2.message : `${r2.action} failed: ${r2.error}`).filter(Boolean).join("\n");
     const failed = run.results.find((r2) => !r2.ok);
     return {
@@ -55656,7 +55730,7 @@ var Daemon = class {
       error: failed?.error,
       state,
       results: run.results,
-      interrupted: run.interrupted
+      interrupted: [run.interrupted, stateError].filter(Boolean).join(" ") || void 0
     };
   }
   // ── autonomous task ──
@@ -55823,11 +55897,17 @@ var Daemon = class {
       case "browser/open":
         return this.serialized(async () => {
           const session = await this.ensureBrowser();
+          let navError;
           if (body?.url && typeof body.url === "string") {
-            await session.navigate(body.url);
+            try {
+              await session.navigate(body.url);
+            } catch (err) {
+              navError = `Opening ${body.url} did not complete (${String(err?.message || err).slice(0, 100)}) \u2014 the page below is what the browser shows now.`;
+            }
           }
           const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true);
-          state.actionsHelp = this.registry.getPromptDescription(state.url || void 0).split("\n").filter((line) => !/^(?:done|request_user_help|write_file|read_file|replace_file|screenshot|save_as_pdf):/.test(line)).join("\n");
+          if (navError) state.notes = [navError, ...state.notes ?? []];
+          state.actionsHelp = this.registry.getPromptDescription().split("\n").filter((line) => !/^(?:done|request_user_help|write_file|read_file|replace_file|screenshot|save_as_pdf):/.test(line)).join("\n");
           return state;
         });
       case "browser/state":
@@ -55842,14 +55922,17 @@ var Daemon = class {
       case "browser/act": {
         const batch = Array.isArray(body?.actions) ? body.actions.filter((a2) => a2 && typeof a2.action === "string" && a2.action.trim()).map((a2) => ({ action: String(a2.action).trim(), params: a2.params && typeof a2.params === "object" ? a2.params : {} })) : void 0;
         if ((!batch || batch.length === 0) && (!body?.action || typeof body.action !== "string")) throw new Error("action (or actions[]) is required");
+        if (typeof body?.token === "string" && body.token) this.setToken(body.token, body.model, body.proxyBase);
         return this.serialized(
           () => this.act(String(body?.action || batch[0].action), body?.params && typeof body.params === "object" ? body.params : {}, body?.inline === true, batch)
         );
       }
       case "browser/close":
-        await this.stopTask();
-        await this.closeBrowser();
-        return { closed: true };
+        return this.serialized(async () => {
+          await this.stopTask();
+          await this.closeBrowser();
+          return { closed: true };
+        });
       case "task/start":
         if (!body?.task || typeof body.task !== "string") throw new Error("task is required");
         return this.startTask(body);

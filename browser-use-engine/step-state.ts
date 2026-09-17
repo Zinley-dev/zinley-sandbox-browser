@@ -9,6 +9,12 @@
  *
  * Shared by the desktop app (BrowserUseManager.browserStep) and the Zinley's
  * Computer daemon. The two engine copies must stay identical.
+ *
+ * `*[` is decided HERE, not by the DOM service: the engine creates a fresh
+ * DOMService per capture, so its own "new since last time" set is always empty
+ * and every element would be starred. We remember the backendNodeIds of the
+ * previous capture per session and star only what was not there on the SAME
+ * page (a fresh page / URL has no stars — everything is new, so nothing is).
  */
 import type { BrowserSession } from './browser/session.js';
 import type { ActionRegistry, ActionContext } from './actions/registry.js';
@@ -55,7 +61,7 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 	};
 	let state: any = null;
 	try {
-		state = await session.getState({ includeScreenshot: false, includeDom: true, includeRecentEvents: false });
+		state = await getStateWithPage(session);
 	} catch (err: any) {
 		out.notes.push(`Page state could not be captured (${String(err?.message || err).slice(0, 120)}) — the page may be mid-navigation; wait a second and look again.`);
 		try {
@@ -76,7 +82,7 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		});
 		selectorMap = state.domState?.selectorMap;
 		out.interactiveCount = selectorMap?.size ?? 0;
-		let elements: string = state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? '';
+		let elements: string = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? '', selectorMap);
 		const pi = state.pageInfo;
 		let above = false;
 		let below = false;
@@ -94,7 +100,11 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 			elements = 'empty page';
 		}
 		if (elements.length > maxChars) {
-			elements = `${elements.slice(0, maxChars)}\n… (${elements.length - maxChars} more chars; scroll or narrow the page)`;
+			// Cut on a line so no `[index]` is half there, and remember which
+			// indices survived: the screenshot must not number boxes the text lacks.
+			const nl = elements.lastIndexOf('\n', maxChars);
+			const keep = nl > maxChars / 2 ? nl : maxChars;
+			elements = `${elements.slice(0, keep)}\n… (${elements.length - keep} more chars not shown; scroll or narrow the page)`;
 			out.elementsTruncated = true;
 		}
 		out.elements = elements;
@@ -105,12 +115,17 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		if (state.isPdfViewer) out.notes.push('This is a PDF viewer — extract cannot read it; scroll to read it, or download the file.');
 	}
 	if (wantShot) {
-		const page: any = session.getPageOrCurrent();
-		let highlighted = false;
-		if (opts.highlight !== false && selectorMap && selectorMap.size > 0) {
-			highlighted = await drawIndexOverlay(page, selectorMap);
-		}
+		let page: any = null;
 		try {
+			page = session.getPageOrCurrent();
+		} catch (err: any) {
+			out.notes.push(`Screenshot skipped (${String(err?.message || err).slice(0, 80)}).`);
+		}
+		let highlighted = false;
+		if (page && opts.highlight !== false && selectorMap && selectorMap.size > 0) {
+			highlighted = await drawIndexOverlay(page, selectorMap, out.elementsTruncated ? indicesIn(out.elements) : undefined);
+		}
+		if (page) try {
 			// CSS-pixel scale: a Retina desktop would otherwise send a 2× image (4× the bytes and tokens).
 			const buf: Buffer = await page.screenshot({ type: 'jpeg', quality: opts.jpegQuality ?? 50, scale: 'css', timeout: 15000 });
 			out.screenshot = buf.toString('base64');
@@ -123,6 +138,52 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 	return out;
 }
 
+const STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false };
+
+/** The site closed the last tab (or the model did): the engine throws "No
+ *  active page" — open a blank one and read that instead of losing the step. */
+async function getStateWithPage(session: BrowserSession): Promise<any> {
+	try {
+		return await session.getState(STATE_OPTS);
+	} catch (err: any) {
+		const ensure = (session as any).ensurePage;
+		if (/no active page/i.test(String(err?.message || err)) && typeof ensure === 'function') {
+			await ensure.call(session);
+			return await session.getState(STATE_OPTS);
+		}
+		throw err;
+	}
+}
+
+const lastSeen = new WeakMap<object, { url: string; ids: Set<number> }>();
+const INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
+
+/** Star an element only when the previous capture of the SAME url did not
+ *  have its node (backendNodeId is stable for the life of a DOM node). */
+function markNewElements(session: BrowserSession, url: string, elements: string, selectorMap: Map<number, any> | undefined): string {
+	const ids = new Set<number>();
+	if (selectorMap) {
+		for (const node of selectorMap.values()) {
+			const id = Number(node?.backendNodeId);
+			if (Number.isFinite(id)) ids.add(id);
+		}
+	}
+	const prev = lastSeen.get(session as object);
+	lastSeen.set(session as object, { url, ids });
+	const samePage = !!prev && prev.url === url && prev.ids.size > 0;
+	return elements.replace(INDEX_LINE, (_m, indent: string, idx: string) => {
+		const id = Number(selectorMap?.get(Number(idx))?.backendNodeId);
+		const isNew = samePage && Number.isFinite(id) && !prev!.ids.has(id);
+		return `${indent}${isNew ? '*' : ''}[${idx}]`;
+	});
+}
+
+function indicesIn(elements: string): Set<number> {
+	const out = new Set<number>();
+	for (const m of elements.matchAll(INDEX_LINE)) out.add(Number(m[2]));
+	return out;
+}
+
 const OVERLAY_ID = 'zinley-step-index-overlay';
 /** Passed to page.evaluate as a STRING on purpose: a bundler that keeps
  *  function names (esbuild keepNames / tsx) rewrites a function's source with
@@ -132,13 +193,14 @@ const REMOVE_OVERLAY_SCRIPT = `(() => { const c = document.getElementById(${JSON
 
 /** Draw the `[index]` boxes and labels over the interactive elements — the
  *  same numbers the element list uses — using the page's own DOM. */
-async function drawIndexOverlay(page: any, selectorMap: Map<number, any>): Promise<boolean> {
+async function drawIndexOverlay(page: any, selectorMap: Map<number, any>, only?: Set<number>): Promise<boolean> {
 	// `absolutePosition` is VIEWPORT-relative (measured: y=1241 for an element whose
 	// document bounds are y=2321 at scrollY=1080); `snapshotNode.bounds` is
 	// document-relative. The overlay is position:fixed, so only the latter needs
 	// the scroll offset taken off.
 	const boxes: Array<{ i: number; x: number; y: number; w: number; h: number; t: string; doc: boolean }> = [];
 	for (const [index, node] of selectorMap.entries()) {
+		if (only && !only.has(index)) continue;
 		const vp = node?.absolutePosition;
 		const p = vp || node?.snapshotNode?.bounds;
 		if (!p || !(p.width > 0) || !(p.height > 0)) continue;
@@ -216,7 +278,12 @@ export interface RunActionsOutcome {
 /**
  * Run one or several engine actions in order — the agent's "up to N actions
  * per step" rule: stop at the first failure, and stop when an action changed
- * the page (a new URL), because the indices the model chose no longer apply.
+ * the page (a new URL, or an action the registry flags as sequence-ending:
+ * navigate / switch / go_back / search …), because the indices the model
+ * chose no longer apply. A click that navigates returns before the URL moves,
+ * so between actions the page gets a short bounded settle before the check.
+ * Whatever was skipped is named in `interrupted` — a batch never looks like
+ * it ran to the end when it did not.
  */
 export async function runStepActions(
 	session: BrowserSession,
@@ -229,33 +296,62 @@ export async function runStepActions(
 	const results: StepActionResult[] = [];
 	let interrupted: string | undefined;
 	const urlBefore = await session.getCurrentPageUrl().catch(() => '');
-	for (let i = 0; i < Math.min(actions.length, max); i++) {
+	const planned = Math.min(actions.length, max);
+	const notRun = (i: number) => (i < planned - 1 ? ` The remaining ${planned - i - 1} action(s) were not run.` : '');
+	for (let i = 0; i < planned; i++) {
 		const { action, params } = actions[i];
 		if (!registry.getAction(action)) {
 			results.push({ action, ok: false, error: `Unknown action '${action}'. Available: ${[...registry.getActions().keys()].join(', ')}` });
+			interrupted = notRun(i).trim() || undefined;
 			break;
 		}
 		try {
 			const r = await registry.execute(action, params ?? {}, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
-			const message = [r.extractedContent, r.longTermMemory].filter(Boolean).join('\n') || undefined;
-			results.push({ action, ok: !r.error, message, error: r.error || undefined });
-			if (r.error) break;
+			// The engine answers a vanished index with a message and NO error
+			// ("Element index 12 not available - page may have changed"); for a
+			// step that is a failure — the next action must not run blind.
+			const gone = !r.error && typeof r.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent);
+			const error = r.error || (gone ? String(r.extractedContent) : undefined);
+			const message = error ? undefined : [r.extractedContent, r.longTermMemory].filter(Boolean).join('\n') || undefined;
+			results.push({ action, ok: !error, message, error });
+			if (error) {
+				interrupted = notRun(i).trim() || undefined;
+				break;
+			}
 		} catch (err: any) {
 			const msg = err?.issues ? `Invalid params: ${JSON.stringify(err.issues)}` : String(err?.message || err);
 			results.push({ action, ok: false, error: msg });
+			interrupted = notRun(i).trim() || undefined;
 			break;
 		}
-		if (i < actions.length - 1) {
+		if (i < planned - 1) {
+			if (typeof (registry as any).terminatesSequence === 'function' && (registry as any).terminatesSequence(action)) {
+				interrupted = `'${action}' changes the page or tab, so the indices you chose no longer apply;${notRun(i)} Look at the page first.`;
+				break;
+			}
+			await settleBetweenActions(session);
 			const urlAfter = await session.getCurrentPageUrl().catch(() => '');
 			if (urlAfter && urlBefore && urlAfter !== urlBefore) {
-				interrupted = `The page changed after '${action}' (${urlAfter}); the remaining ${actions.length - i - 1} action(s) were not run — look at the new page first.`;
+				interrupted = `The page changed after '${action}' (${urlAfter});${notRun(i)} Look at the new page first.`;
 				break;
 			}
 		}
 	}
-	if (actions.length > max) interrupted = interrupted ?? `Only the first ${max} actions were run.`;
+	if (actions.length > max && !interrupted) interrupted = `Only the first ${max} actions were run.`;
 	if (results.some(r => r.ok)) await settleAfterActions(session);
 	return { ok: results.length > 0 && results.every(r => r.ok), results, interrupted };
+}
+
+/** Between two actions of a batch: a click that navigates has returned but the
+ *  URL has not moved yet. Short and bounded (≤ ~1.8 s); never throws. */
+async function settleBetweenActions(session: BrowserSession): Promise<void> {
+	try {
+		await new Promise(resolve => setTimeout(resolve, 300));
+		const page: any = session.getPageOrCurrent();
+		await page.waitForLoadState('domcontentloaded', { timeout: 1500 }).catch(() => undefined);
+	} catch {
+		/* best effort */
+	}
 }
 
 /**
