@@ -133,11 +133,16 @@ const REMOVE_OVERLAY_SCRIPT = `(() => { const c = document.getElementById(${JSON
 /** Draw the `[index]` boxes and labels over the interactive elements — the
  *  same numbers the element list uses — using the page's own DOM. */
 async function drawIndexOverlay(page: any, selectorMap: Map<number, any>): Promise<boolean> {
-	const boxes: Array<{ i: number; x: number; y: number; w: number; h: number; t: string }> = [];
+	// `absolutePosition` is VIEWPORT-relative (measured: y=1241 for an element whose
+	// document bounds are y=2321 at scrollY=1080); `snapshotNode.bounds` is
+	// document-relative. The overlay is position:fixed, so only the latter needs
+	// the scroll offset taken off.
+	const boxes: Array<{ i: number; x: number; y: number; w: number; h: number; t: string; doc: boolean }> = [];
 	for (const [index, node] of selectorMap.entries()) {
-		const p = node?.absolutePosition || node?.snapshotNode?.bounds;
+		const vp = node?.absolutePosition;
+		const p = vp || node?.snapshotNode?.bounds;
 		if (!p || !(p.width > 0) || !(p.height > 0)) continue;
-		boxes.push({ i: index, x: p.x, y: p.y, w: p.width, h: p.height, t: String(node?.nodeName || node?.tagName || '').toLowerCase() });
+		boxes.push({ i: index, x: p.x, y: p.y, w: p.width, h: p.height, t: String(node?.nodeName || node?.tagName || '').toLowerCase(), doc: !vp });
 	}
 	if (boxes.length === 0) return false;
 	const script = `(() => {
@@ -150,7 +155,7 @@ async function drawIndexOverlay(page: any, selectorMap: Map<number, any>): Promi
 		root.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
 		const colors = { a: '#2563eb', button: '#dc2626', input: '#059669', textarea: '#059669', select: '#7c3aed' };
 		for (const b of data) {
-			const x = b.x - sx, y = b.y - sy;
+			const x = b.doc ? b.x - sx : b.x, y = b.doc ? b.y - sy : b.y;
 			if (x + b.w < 0 || y + b.h < 0 || x > vw || y > vh) continue;
 			const c = colors[b.t] || '#ea580c';
 			const box = document.createElement('div');

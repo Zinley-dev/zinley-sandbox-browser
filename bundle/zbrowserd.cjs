@@ -55316,9 +55316,10 @@ var REMOVE_OVERLAY_SCRIPT = `(() => { const c = document.getElementById(${JSON.s
 async function drawIndexOverlay(page, selectorMap) {
   const boxes = [];
   for (const [index, node] of selectorMap.entries()) {
-    const p2 = node?.absolutePosition || node?.snapshotNode?.bounds;
+    const vp = node?.absolutePosition;
+    const p2 = vp || node?.snapshotNode?.bounds;
     if (!p2 || !(p2.width > 0) || !(p2.height > 0)) continue;
-    boxes.push({ i: index, x: p2.x, y: p2.y, w: p2.width, h: p2.height, t: String(node?.nodeName || node?.tagName || "").toLowerCase() });
+    boxes.push({ i: index, x: p2.x, y: p2.y, w: p2.width, h: p2.height, t: String(node?.nodeName || node?.tagName || "").toLowerCase(), doc: !vp });
   }
   if (boxes.length === 0) return false;
   const script = `(() => {
@@ -55331,7 +55332,7 @@ async function drawIndexOverlay(page, selectorMap) {
 		root.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483647;';
 		const colors = { a: '#2563eb', button: '#dc2626', input: '#059669', textarea: '#059669', select: '#7c3aed' };
 		for (const b of data) {
-			const x = b.x - sx, y = b.y - sy;
+			const x = b.doc ? b.x - sx : b.x, y = b.doc ? b.y - sy : b.y;
 			if (x + b.w < 0 || y + b.h < 0 || x > vw || y > vh) continue;
 			const c = colors[b.t] || '#ea580c';
 			const box = document.createElement('div');
