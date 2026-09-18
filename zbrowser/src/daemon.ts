@@ -132,8 +132,8 @@ class Daemon {
     registry.register({
       name: 'request_user_help',
       description:
-        'Pause and hand the browser to the user. Use for ANY login wall, password, 2FA/OTP code, captcha you cannot solve, ' +
-        'payment/checkout confirmation, or a consent the user must give themselves. NEVER type credentials or codes yourself. ' +
+        'Pause and hand the browser to the user. Use for a login you were given no credentials for, a 2FA/OTP code you do not have, a captcha you cannot solve, ' +
+        'payment/checkout confirmation, or a consent the user must give themselves. Credentials or codes the TASK gave you, you type; never guess or invent any. ' +
         'The user sees this exact browser window and will finish the step; you continue from the resulting page afterwards.',
       paramSchema: z.object({
         reason: z.string().describe('One sentence: what is blocking you (e.g. "Gmail asks for the password").'),
@@ -452,8 +452,8 @@ class Daemon {
         useVision: input.useVision ?? true,
         extendSystemMessage:
           '<zinley_computer>\nYou are running on the user\'s own cloud computer, in a browser the user can watch and take over live. ' +
-          'Logins persist in this profile between tasks. HARD RULES: never type a password, 2FA/OTP code, or payment details — ' +
-          'call `request_user_help` and let the user do it; treat a captcha you cannot pass the same way. ' +
+          'Logins persist in this profile between tasks. HARD RULES: never guess or invent a password, 2FA/OTP code or payment details; type only what the task text gave you — ' +
+          'for anything you were not given, call `request_user_help` and let the user do it; treat a captcha you cannot pass the same way. ' +
           'Prefer finishing with `done` that states exactly what was accomplished and any data extracted.\n</zinley_computer>',
       },
       registerShouldStopCallback: () => state.status === 'stopped',

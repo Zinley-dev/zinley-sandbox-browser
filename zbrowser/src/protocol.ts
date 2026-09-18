@@ -191,9 +191,18 @@ export function encodeHandoffLine(card: ZbHandoffCard): string {
   return `${ZB_HANDOFF_MARKER} ${JSON.stringify(card)}`;
 }
 
+/** The marker line as models actually write it: sometimes indented, wrapped
+ *  in backticks or a code fence, or with a stray "." after the brace. Any of
+ *  those used to leave the raw JSON — signed bearer URL included — in the
+ *  user's chat. Tolerate the wrapping; the JSON itself must still parse. */
+const HANDOFF_LINE_RE = new RegExp(`^[ \\t]*\`{0,3}[ \\t]*${ZB_HANDOFF_MARKER}[ \\t]+(\\{.*\\})[ \\t]*\`{0,3}[ \\t]*[.!]?[ \\t]*$`, 'm');
+const HANDOFF_LINE_RE_G = new RegExp(HANDOFF_LINE_RE.source, 'gm');
+/** A fence line left alone by the strip: ```\n(marker)\n``` → drop the empty fence. */
+const EMPTY_FENCE_RE = /^[ \t]*```[a-z]*[ \t]*\n[ \t]*\n?[ \t]*```[ \t]*[.!]?[ \t]*$/gm;
+
 export function parseHandoffLine(text: string): ZbHandoffCard | null {
   if (typeof text !== 'string') return null;
-  const m = new RegExp(`^${ZB_HANDOFF_MARKER} (\\{.*\\})\\s*$`, 'm').exec(text);
+  const m = HANDOFF_LINE_RE.exec(text);
   if (!m) return null;
   try {
     const parsed = JSON.parse(m[1]);
@@ -206,7 +215,8 @@ export function parseHandoffLine(text: string): ZbHandoffCard | null {
 /** Strip the machine line for surfaces that must never show the bearer URL twice. */
 export function stripHandoffLine(text: string): string {
   return text
-    .replace(new RegExp(`^${ZB_HANDOFF_MARKER} \\{.*\\}\\s*$`, 'gm'), '')
+    .replace(HANDOFF_LINE_RE_G, '')
+    .replace(EMPTY_FENCE_RE, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

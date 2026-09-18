@@ -55475,6 +55475,9 @@ var ZB_RUNTIME_DIR = `${ZB_STATE_DIR}/zbrowser`;
 var ZB_SRC_DIR = `${ZB_STATE_DIR}/zbrowser-src`;
 var ZB_DEPS_DIR = `${ZB_STATE_DIR}/rt`;
 var ZB_LOG_FILE = `${ZB_STATE_DIR}/zbrowser.log`;
+var ZB_HANDOFF_MARKER = "ZB_HANDOFF";
+var HANDOFF_LINE_RE = new RegExp(`^[ \\t]*\`{0,3}[ \\t]*${ZB_HANDOFF_MARKER}[ \\t]+(\\{.*\\})[ \\t]*\`{0,3}[ \\t]*[.!]?[ \\t]*$`, "m");
+var HANDOFF_LINE_RE_G = new RegExp(HANDOFF_LINE_RE.source, "gm");
 
 // sandbox-runtime/zbrowser/src/daemon.ts
 var VERSION2 = true ? "2026-09-18-ec970e4" : "dev";
@@ -55534,7 +55537,7 @@ var Daemon = class {
     for (const name of DISABLED_ACTIONS) registry.unregister(name);
     registry.register({
       name: "request_user_help",
-      description: "Pause and hand the browser to the user. Use for ANY login wall, password, 2FA/OTP code, captcha you cannot solve, payment/checkout confirmation, or a consent the user must give themselves. NEVER type credentials or codes yourself. The user sees this exact browser window and will finish the step; you continue from the resulting page afterwards.",
+      description: "Pause and hand the browser to the user. Use for a login you were given no credentials for, a 2FA/OTP code you do not have, a captcha you cannot solve, payment/checkout confirmation, or a consent the user must give themselves. Credentials or codes the TASK gave you, you type; never guess or invent any. The user sees this exact browser window and will finish the step; you continue from the resulting page afterwards.",
       paramSchema: external_exports.object({
         reason: external_exports.string().describe('One sentence: what is blocking you (e.g. "Gmail asks for the password").'),
         what_to_do: external_exports.string().describe('What the user should do in the browser (e.g. "Log in to Gmail, then tell me done").')
@@ -55822,7 +55825,7 @@ var Daemon = class {
       maxSteps,
       settings: {
         useVision: input.useVision ?? true,
-        extendSystemMessage: "<zinley_computer>\nYou are running on the user's own cloud computer, in a browser the user can watch and take over live. Logins persist in this profile between tasks. HARD RULES: never type a password, 2FA/OTP code, or payment details \u2014 call `request_user_help` and let the user do it; treat a captcha you cannot pass the same way. Prefer finishing with `done` that states exactly what was accomplished and any data extracted.\n</zinley_computer>"
+        extendSystemMessage: "<zinley_computer>\nYou are running on the user's own cloud computer, in a browser the user can watch and take over live. Logins persist in this profile between tasks. HARD RULES: never guess or invent a password, 2FA/OTP code or payment details; type only what the task text gave you \u2014 for anything you were not given, call `request_user_help` and let the user do it; treat a captcha you cannot pass the same way. Prefer finishing with `done` that states exactly what was accomplished and any data extracted.\n</zinley_computer>"
       },
       registerShouldStopCallback: () => state.status === "stopped",
       registerNewStepCallback: async (browserState, modelOutput, stepNumber) => {
