@@ -782,6 +782,12 @@ function send(res: http.ServerResponse, status: number, payload: ZbResponse<unkn
   res.end(text);
 }
 
+server.on('error', (err: any) => {
+  // A second instance on a live port (EADDRINUSE) must exit at once and say
+  // so, instead of lingering with no server.
+  log(`server error: ${err?.code || ''} ${err?.message || err}`);
+  process.exit(1);
+});
 server.listen(PORT, '127.0.0.1', () => {
   log(`listening on 127.0.0.1:${PORT} version=${VERSION} display=${DISPLAY} workspace=${WORKSPACE}`);
 });

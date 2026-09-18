@@ -607,7 +607,33 @@ const STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientR
 
 /** Is the page still fetching or showing a loading state? (Same signals the
  *  engine's readiness wait uses: unfinished resources, spinners, aria-busy.) */
-const LOADING_PROBE = `(() => { const pending = performance.getEntriesByType('resource').filter(e => e.responseEnd === 0).length; const ind = document.querySelector('[aria-busy="true"],[data-loading="true"],[class*="spinner" i],[class*="skeleton" i],.loading,[class^="loading" i],[class*=" loading" i]'); const vis = ind && (() => { const r = ind.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; })(); return { pending, indicator: !!vis, ready: document.readyState }; })()`;
+const LOADING_PROBE = `(() => {
+	// Only requests that STARTED recently and have not finished: a long-poll,
+	// an event stream or a websocket-ish request never ends and would say
+	// "still loading" forever on any page with a live feed.
+	const t = performance.now();
+	const pending = performance.getEntriesByType('resource').filter(e => e.responseEnd === 0 && t - e.startTime < 5000).length;
+	// A visible indicator whose class is a whole token (spinner / skeleton /
+	// loading / is-loading), never an <img loading="lazy"> or a "loading-lazy"
+	// class that is on the page for good.
+	const tok = /(^|[\\s_-])(spinner|skeleton|loading|loader)([\\s_-]|$)/i;
+	let indicator = false;
+	for (const e of document.querySelectorAll('[aria-busy="true"],[data-loading="true"],[class*="spinner" i],[class*="skeleton" i],[class*="loading" i],[class*="loader" i]')) {
+		if (e.tagName === 'IMG' || e.tagName === 'SCRIPT' || e.tagName === 'STYLE') continue;
+		const cls = String(e.getAttribute('class') || '');
+		const explicit = e.getAttribute('aria-busy') === 'true' || e.getAttribute('data-loading') === 'true';
+		// A class token alone is not enough (a design system's "sk-skeleton-off"
+		// is on the page for good): the element must also animate, like a real
+		// spinner or a pulsing skeleton, or literally say it is loading.
+		const cs = getComputedStyle(e);
+		const animated = cs.animationName !== 'none' || cs.transitionProperty === 'opacity';
+		const says = /loading|please wait/i.test((e.textContent || '').slice(0, 80));
+		if (!(explicit || (tok.test(cls) && (animated || says)))) continue;
+		const r = e.getBoundingClientRect();
+		if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight) { indicator = true; break; }
+	}
+	return { pending, indicator, ready: document.readyState };
+})()`;
 
 /**
  * Single-page apps keep rendering after "load" and network idle (DoorDash:
