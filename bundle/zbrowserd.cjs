@@ -55345,6 +55345,16 @@ ${elements}`;
       out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(" | ")}`);
     }
     if (state.stateError) out.notes.push(String(state.stateError));
+    try {
+      const page = session.getPageOrCurrent();
+      const l2 = await page.evaluate(LOADING_PROBE).catch(() => null);
+      if (l2 && (l2.indicator || l2.pending > 2 || l2.ready === "loading")) {
+        out.notes.push(
+          `Page still loading (${l2.indicator ? "a loading indicator is visible" : `${l2.pending} requests in flight`}) \u2014 what you see may be incomplete: wait{seconds:2} then op="state" before acting on it.`
+        );
+      }
+    } catch {
+    }
     const overlays = Array.isArray(state.modalOverlays) ? state.modalOverlays : [];
     const dialog = overlays.find((o2) => /role=(?:dialog|alertdialog)|aria-modal/i.test(o2.reason));
     if (dialog) {
@@ -55390,6 +55400,21 @@ async function getStateWithPage(session) {
   }
 }
 var lastSeen = /* @__PURE__ */ new WeakMap();
+var lastNodes = /* @__PURE__ */ new WeakMap();
+function identityOf(node) {
+  let xpath = "";
+  let hash = 0;
+  try {
+    xpath = getXPath(node);
+  } catch {
+  }
+  try {
+    hash = calculateElementHash(node);
+  } catch {
+  }
+  const attrs = node?.attributes || {};
+  return { xpath, hash, tag: String(node?.nodeName || "").toLowerCase(), id: String(attrs.id || ""), name: String(node?.axNode?.name || node?.text || "").trim().slice(0, 80) };
+}
 var loopMemo = /* @__PURE__ */ new WeakMap();
 var STUCK_EVERY = 4;
 var lastDelta;
@@ -55404,6 +55429,11 @@ function markNewElements(session, url, elements, selectorMap) {
   }
   const prev = lastSeen.get(session);
   lastSeen.set(session, { url, ids });
+  if (selectorMap) {
+    const idents = /* @__PURE__ */ new Map();
+    for (const [index, node] of selectorMap.entries()) idents.set(index, identityOf(node));
+    lastNodes.set(session, idents);
+  }
   const samePage = !!prev && prev.url === url && prev.ids.size > 0;
   lastDelta = !prev ? void 0 : prev.url !== url ? `Navigated: ${prev.url || "(blank)"} \u2192 ${url}` : (() => {
     let fresh = 0;
@@ -55480,10 +55510,21 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
       break;
     }
     try {
-      const r2 = await registry.execute(action, params ?? {}, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
-      const gone = !r2.error && typeof r2.extractedContent === "string" && /^Element index \d+ not available/.test(r2.extractedContent);
-      const error = r2.error || (gone ? String(r2.extractedContent) : void 0);
-      const message = error ? void 0 : [r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n") || void 0;
+      let useParams = { ...params ?? {} };
+      let retargetNote = "";
+      const isGone = (r3) => !r3?.error && typeof r3?.extractedContent === "string" && /^Element index \d+ not available/.test(r3.extractedContent);
+      let r2 = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+      if (isGone(r2) && typeof useParams.index === "number") {
+        const again = await retarget(session, useParams.index);
+        if (again) {
+          useParams = { ...useParams, index: again.index };
+          retargetNote = again.index === params?.index ? "" : ` (re-targeted [${params?.index}] \u2192 [${again.index}]: ${again.how})`;
+          r2 = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+        }
+      }
+      const gone = isGone(r2);
+      const error = r2.error || (gone ? `${String(r2.extractedContent)} It is not on the page any more (the page redrew or moved on) \u2014 look again before choosing.` : void 0);
+      const message = error ? void 0 : ([r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n") || void 0) && `${[r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n")}${retargetNote}`;
       results.push({ action, ok: !error, message, error });
       if (error) {
         interrupted = notRun(i2).trim() || void 0;
@@ -55526,9 +55567,38 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
   if (results.some((r2) => r2.ok)) {
     const ran = results.filter((r2) => r2.ok).map((r2) => r2.action);
     const light = ran.every((a2) => LIGHT_ACTIONS.has(a2)) && !ran.some((a2, i2) => a2 === "send_keys" && /enter|return/i.test(String(results[i2]?.message || "")));
-    await settleAfterActions(session, light ? { light: true } : void 0);
+    await settleAfterActions(session, light ? { light: true, scrolled: ran.includes("scroll") } : void 0);
   }
   return { ok: results.length > 0 && results.every((r2) => r2.ok), results, interrupted };
+}
+async function retarget(session, index) {
+  const ident = lastNodes.get(session)?.get(index);
+  if (!ident) return null;
+  let state = null;
+  try {
+    state = await getStateWithPage(session);
+  } catch {
+    return null;
+  }
+  const map = state?.domState?.selectorMap;
+  if (!map) return null;
+  if (map.has(index)) return { index, how: "still present" };
+  const byHash = [];
+  const byXpath = [];
+  const byId = [];
+  const byName = [];
+  for (const [i2, node] of map.entries()) {
+    const cur = identityOf(node);
+    if (ident.hash && cur.hash === ident.hash) byHash.push(i2);
+    if (ident.xpath && cur.xpath === ident.xpath) byXpath.push(i2);
+    if (ident.id && cur.tag === ident.tag && cur.id === ident.id) byId.push(i2);
+    if (ident.name && cur.tag === ident.tag && cur.name === ident.name) byName.push(i2);
+  }
+  if (byHash.length === 1) return { index: byHash[0], how: "same element after a re-render" };
+  if (byId.length === 1) return { index: byId[0], how: `same #${ident.id} after a re-render` };
+  if (byXpath.length === 1) return { index: byXpath[0], how: "same place in the page after a re-render" };
+  if (byName.length === 1) return { index: byName[0], how: `the only <${ident.tag}> named "${ident.name}" after a re-render` };
+  return null;
 }
 async function settleBetweenActions(session) {
   try {
@@ -55544,7 +55614,7 @@ async function settleAfterActions(session, opts = {}) {
     const page = session.getPageOrCurrent();
     if (opts.light) {
       await new Promise((resolve2) => setTimeout(resolve2, 250));
-      await waitUntilStable(page, { maxMs: 900, intervalMs: 300 });
+      await waitUntilStable(page, { maxMs: opts.scrolled ? 1500 : 900, intervalMs: 300 });
       return;
     }
     await page.waitForLoadState("domcontentloaded", { timeout: 2e3 }).catch(() => void 0);
@@ -55554,7 +55624,8 @@ async function settleAfterActions(session, opts = {}) {
   } catch {
   }
 }
-var STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n + ':' + document.body?.innerText?.length; })()`;
+var STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n; })()`;
+var LOADING_PROBE = `(() => { const pending = performance.getEntriesByType('resource').filter(e => e.responseEnd === 0).length; const ind = document.querySelector('[aria-busy="true"],[data-loading="true"],[class*="spinner" i],[class*="skeleton" i],.loading,[class^="loading" i],[class*=" loading" i]'); const vis = ind && (() => { const r = ind.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; })(); return { pending, indicator: !!vis, ready: document.readyState }; })()`;
 async function waitUntilStable(page, opts = {}) {
   const maxMs = opts.maxMs ?? 4e3;
   const intervalMs = opts.intervalMs ?? 300;

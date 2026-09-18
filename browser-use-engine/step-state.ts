@@ -18,7 +18,7 @@
  */
 import type { BrowserSession } from './browser/session.js';
 import type { ActionRegistry, ActionContext } from './actions/registry.js';
-import { DEFAULT_INCLUDE_ATTRIBUTES } from './dom/views.js';
+import { DEFAULT_INCLUDE_ATTRIBUTES, getXPath, calculateElementHash } from './dom/views.js';
 
 export interface StepTab {
 	/** Last four characters of the target id — enough to `switch{tab_id}` by. */
@@ -131,6 +131,17 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 			out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(' | ')}`);
 		}
 		if (state.stateError) out.notes.push(String(state.stateError));
+		try {
+			const page: any = session.getPageOrCurrent();
+			const l: any = await page.evaluate(LOADING_PROBE).catch(() => null);
+			if (l && (l.indicator || l.pending > 2 || l.ready === 'loading')) {
+				out.notes.push(
+					`Page still loading (${l.indicator ? 'a loading indicator is visible' : `${l.pending} requests in flight`}) — what you see may be incomplete: wait{seconds:2} then op="state" before acting on it.`,
+				);
+			}
+		} catch {
+			/* best effort */
+		}
 		// A dialog / cookie banner / overlay in front of the page: the engine
 		// detected it but only logged it — the model must close it first.
 		const overlays: Array<{ backendNodeId: number; nodeName: string; reason: string }> = Array.isArray(state.modalOverlays) ? state.modalOverlays : [];
@@ -189,6 +200,25 @@ async function getStateWithPage(session: BrowserSession): Promise<any> {
 }
 
 const lastSeen = new WeakMap<object, { url: string; ids: Set<number> }>();
+/** index → identity of the node the model was shown, so a re-rendered page can be re-targeted. */
+interface NodeIdentity { xpath: string; hash: number; tag: string; id: string; name: string }
+const lastNodes = new WeakMap<object, Map<number, NodeIdentity>>();
+function identityOf(node: any): NodeIdentity {
+	let xpath = '';
+	let hash = 0;
+	try {
+		xpath = getXPath(node);
+	} catch {
+		/* no xpath */
+	}
+	try {
+		hash = calculateElementHash(node);
+	} catch {
+		/* no hash */
+	}
+	const attrs = node?.attributes || {};
+	return { xpath, hash, tag: String(node?.nodeName || '').toLowerCase(), id: String(attrs.id || ''), name: String(node?.axNode?.name || node?.text || '').trim().slice(0, 80) };
+}
 /** Per-session loop awareness: how many captures in a row saw the same page
  *  with nothing new, and the last action that failed (to catch a blind retry). */
 const loopMemo = new WeakMap<object, { url: string; stuck: number; lastFailKey?: string; lastFailUrl?: string; sameFail: number }>();
@@ -209,6 +239,11 @@ function markNewElements(session: BrowserSession, url: string, elements: string,
 	}
 	const prev = lastSeen.get(session as object);
 	lastSeen.set(session as object, { url, ids });
+	if (selectorMap) {
+		const idents = new Map<number, NodeIdentity>();
+		for (const [index, node] of selectorMap.entries()) idents.set(index, identityOf(node));
+		lastNodes.set(session as object, idents);
+	}
 	const samePage = !!prev && prev.url === url && prev.ids.size > 0;
 	lastDelta = !prev
 		? undefined
@@ -355,13 +390,24 @@ export async function runStepActions(
 			break;
 		}
 		try {
-			const r = await registry.execute(action, params ?? {}, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+			let useParams: Record<string, unknown> = { ...(params ?? {}) };
+			let retargetNote = '';
+			const isGone = (r: any) => !r?.error && typeof r?.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent);
+			let r = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
 			// The engine answers a vanished index with a message and NO error
-			// ("Element index 12 not available - page may have changed"); for a
-			// step that is a failure — the next action must not run blind.
-			const gone = !r.error && typeof r.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent);
-			const error = r.error || (gone ? String(r.extractedContent) : undefined);
-			const message = error ? undefined : [r.extractedContent, r.longTermMemory].filter(Boolean).join('\n') || undefined;
+			// ("Element index 12 not available - page may have changed"). The page
+			// usually just redrew: find the same control again and try once more.
+			if (isGone(r) && typeof useParams.index === 'number') {
+				const again = await retarget(session, useParams.index);
+				if (again) {
+					useParams = { ...useParams, index: again.index };
+					retargetNote = again.index === params?.index ? '' : ` (re-targeted [${params?.index}] → [${again.index}]: ${again.how})`;
+					r = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+				}
+			}
+			const gone = isGone(r);
+			const error = r.error || (gone ? `${String(r.extractedContent)} It is not on the page any more (the page redrew or moved on) — look again before choosing.` : undefined);
+			const message = error ? undefined : ([r.extractedContent, r.longTermMemory].filter(Boolean).join('\n') || undefined) && `${[r.extractedContent, r.longTermMemory].filter(Boolean).join('\n')}${retargetNote}`;
 			results.push({ action, ok: !error, message, error });
 			if (error) {
 				interrupted = notRun(i).trim() || undefined;
@@ -409,9 +455,46 @@ export async function runStepActions(
 		// settle (network idle + stability polling) would add ~1 s for nothing.
 		const ran = results.filter(r => r.ok).map(r => r.action);
 		const light = ran.every(a => LIGHT_ACTIONS.has(a)) && !ran.some((a, i) => a === 'send_keys' && /enter|return/i.test(String(results[i]?.message || '')));
-		await settleAfterActions(session, light ? { light: true } : undefined);
+		await settleAfterActions(session, light ? { light: true, scrolled: ran.includes('scroll') } : undefined);
 	}
 	return { ok: results.length > 0 && results.every(r => r.ok), results, interrupted };
+}
+
+/**
+ * Frameworks redraw nodes between the model's look and its action, so the
+ * [index] it chose can be gone while the same control is still on the page.
+ * Re-read the page and find that control again: same hash (structure +
+ * attributes + name), else same xpath, else same tag + id, else same tag +
+ * name when unique. Returns the new index or null.
+ */
+async function retarget(session: BrowserSession, index: number): Promise<{ index: number; how: string } | null> {
+	const ident = lastNodes.get(session as object)?.get(index);
+	if (!ident) return null;
+	let state: any = null;
+	try {
+		state = await getStateWithPage(session);
+	} catch {
+		return null;
+	}
+	const map: Map<number, any> | undefined = state?.domState?.selectorMap;
+	if (!map) return null;
+	if (map.has(index)) return { index, how: 'still present' };
+	const byHash: number[] = [];
+	const byXpath: number[] = [];
+	const byId: number[] = [];
+	const byName: number[] = [];
+	for (const [i, node] of map.entries()) {
+		const cur = identityOf(node);
+		if (ident.hash && cur.hash === ident.hash) byHash.push(i);
+		if (ident.xpath && cur.xpath === ident.xpath) byXpath.push(i);
+		if (ident.id && cur.tag === ident.tag && cur.id === ident.id) byId.push(i);
+		if (ident.name && cur.tag === ident.tag && cur.name === ident.name) byName.push(i);
+	}
+	if (byHash.length === 1) return { index: byHash[0], how: 'same element after a re-render' };
+	if (byId.length === 1) return { index: byId[0], how: `same #${ident.id} after a re-render` };
+	if (byXpath.length === 1) return { index: byXpath[0], how: 'same place in the page after a re-render' };
+	if (byName.length === 1) return { index: byName[0], how: `the only <${ident.tag}> named "${ident.name}" after a re-render` };
+	return null;
 }
 
 /** Between two actions of a batch: a click that navigates has returned but the
@@ -433,13 +516,14 @@ async function settleBetweenActions(session: BrowserSession): Promise<void> {
  */
 const LIGHT_ACTIONS = new Set(['scroll', 'input', 'select_dropdown', 'dropdown_options', 'find_text', 'search_page', 'find_elements', 'extract', 'wait']);
 
-export async function settleAfterActions(session: BrowserSession, opts: { light?: boolean } = {}): Promise<void> {
+export async function settleAfterActions(session: BrowserSession, opts: { light?: boolean; scrolled?: boolean } = {}): Promise<void> {
 	try {
 		const page: any = session.getPageOrCurrent();
 		if (opts.light) {
-			// Enough for a suggestion dropdown or a re-rendered list to appear.
+			// Enough for a suggestion dropdown or a re-rendered list to appear; a
+			// scroll gets a little longer for lazy-loaded rows.
 			await new Promise(resolve => setTimeout(resolve, 250));
-			await waitUntilStable(page, { maxMs: 900, intervalMs: 300 });
+			await waitUntilStable(page, { maxMs: opts.scrolled ? 1500 : 900, intervalMs: 300 });
 			return;
 		}
 		await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => undefined);
@@ -452,7 +536,11 @@ export async function settleAfterActions(session: BrowserSession, opts: { light?
 	}
 }
 
-const STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n + ':' + document.body?.innerText?.length; })()`;
+const STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n; })()`;
+
+/** Is the page still fetching or showing a loading state? (Same signals the
+ *  engine's readiness wait uses: unfinished resources, spinners, aria-busy.) */
+const LOADING_PROBE = `(() => { const pending = performance.getEntriesByType('resource').filter(e => e.responseEnd === 0).length; const ind = document.querySelector('[aria-busy="true"],[data-loading="true"],[class*="spinner" i],[class*="skeleton" i],.loading,[class^="loading" i],[class*=" loading" i]'); const vis = ind && (() => { const r = ind.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; })(); return { pending, indicator: !!vis, ready: document.readyState }; })()`;
 
 /**
  * Single-page apps keep rendering after "load" and network idle (DoorDash:
