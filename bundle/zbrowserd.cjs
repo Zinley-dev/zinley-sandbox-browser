@@ -34119,6 +34119,20 @@ var DOMService = class _DOMService {
     this.page = page;
     this.cdpSession = null;
     this.previousElements = /* @__PURE__ */ new Set();
+    /**
+     * Format DOM tree as text for LLM consumption
+     * Uses format: [backendNodeId]<tag attr=value />
+     * Matches Python browser-use serializer.py exactly
+     *
+     * @param domTree - The DOM tree nodes to format
+     * @param indent - Current indentation level
+     * @param showNewElements - Whether to mark new elements with *
+     * @param selectorMap - Optional filtered selector map. If provided, only elements
+     *                      whose index exists in this map will be included in the output.
+     *                      This ensures the LLM only sees indices that are valid for actions.
+     */
+    /** Last plain-text line emitted by formatDOMForLLM (dedupes a label repeated by nested wrappers). */
+    this.lastEmittedText = "";
     this.crossOriginIframes = options.crossOriginIframes ?? false;
     this.paintOrderFiltering = options.paintOrderFiltering ?? true;
     this.maxIframes = options.maxIframes ?? 100;
@@ -34437,7 +34451,7 @@ var DOMService = class _DOMService {
    */
   isInteractiveNode(nodeName, attributes, isClickable, axNode, bounds, cursorStyle, hasJsClickListener, cdpNode) {
     const tag = nodeName.toLowerCase();
-    if (tag === "html" || tag === "body") {
+    if (tag === "html" || tag === "body" && attributes.contenteditable !== "true" && attributes.contenteditable !== "") {
       return false;
     }
     if (hasJsClickListener) {
@@ -35466,6 +35480,21 @@ var DOMService = class _DOMService {
           } : null
         };
         selectorMap.set(backendNodeId, enhancedNode);
+      } else if (isVisible && !isInteractive && node.children) {
+        if (!TEXT_SKIP_TAGS.has(String(nodeName || "").toUpperCase())) {
+          const parts = [];
+          for (const child of node.children) {
+            if (child.nodeType === 3 && child.nodeValue) {
+              const t2 = child.nodeValue.replace(/\s+/g, " ").trim();
+              if (t2.length > 1) parts.push(t2);
+            }
+          }
+          if (parts.length > 0) {
+            let text = parts.join(" ");
+            if (text.length > ELEMENT_TEXT_MAX_CHARS) text = `${text.slice(0, ELEMENT_TEXT_MAX_CHARS)}\u2026`;
+            treeNode.text = text;
+          }
+        }
       }
       const shadowRootNodeIds = /* @__PURE__ */ new Set();
       if (node.shadowRoots) {
@@ -35621,20 +35650,9 @@ var DOMService = class _DOMService {
     console.log(`\u{1F4CB} [DOM] Extracted ${filteredSelectorMap.size} interactive elements with real backendNodeIds (${paintOrderFiltered} filtered by paint order, ${bboxFiltered} filtered by bbox)`);
     return state;
   }
-  /**
-   * Format DOM tree as text for LLM consumption
-   * Uses format: [backendNodeId]<tag attr=value />
-   * Matches Python browser-use serializer.py exactly
-   *
-   * @param domTree - The DOM tree nodes to format
-   * @param indent - Current indentation level
-   * @param showNewElements - Whether to mark new elements with *
-   * @param selectorMap - Optional filtered selector map. If provided, only elements
-   *                      whose index exists in this map will be included in the output.
-   *                      This ensures the LLM only sees indices that are valid for actions.
-   */
   formatDOMForLLM(domTree, indent = 0, showNewElements = true, selectorMap) {
     let output = "";
+    if (indent === 0) this.lastEmittedText = "";
     for (const node of domTree) {
       const isInSelectorMap = !selectorMap || selectorMap.has(node.index);
       if (node.isInteractive && isInSelectorMap) {
@@ -35726,6 +35744,14 @@ var DOMService = class _DOMService {
         } else if (node.hasHiddenContent) {
           output += `${prefix}	... (more content below viewport - scroll to reveal)
 `;
+        }
+      }
+      if (!node.isInteractive && node.isVisible && node.text && node.text.trim().length > 1) {
+        const t2 = node.text.trim();
+        if (t2 !== this.lastEmittedText) {
+          output += `${"	".repeat(indent)}${t2}
+`;
+          this.lastEmittedText = t2;
         }
       }
       if (node.children.length > 0) {

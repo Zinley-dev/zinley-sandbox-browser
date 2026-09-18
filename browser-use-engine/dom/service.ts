@@ -842,8 +842,10 @@ export class DOMService {
 	): boolean {
 		const tag = nodeName.toLowerCase();
 
-		// Skip html and body nodes (like Python)
-		if (tag === 'html' || tag === 'body') {
+		// Skip html and body nodes (like Python) — except an editable body: rich
+		// text editors (TinyMCE, CKEditor, many mail composers) put
+		// contenteditable on the BODY of their iframe, and that is the field.
+		if (tag === 'html' || (tag === 'body' && attributes.contenteditable !== 'true' && attributes.contenteditable !== '')) {
 			return false;
 		}
 
@@ -2257,6 +2259,24 @@ export class DOMService {
 					} : null,
 				};
 				selectorMap.set(backendNodeId, enhancedNode);
+			} else if (isVisible && !isInteractive && node.children) {
+				// Upstream prints visible text nodes as their own lines (a flash message,
+				// a price, "You clicked: Ok"). Only this element's DIRECT text, capped,
+				// never script-like content.
+				if (!TEXT_SKIP_TAGS.has(String(nodeName || '').toUpperCase())) {
+					const parts: string[] = [];
+					for (const child of node.children) {
+						if (child.nodeType === 3 && child.nodeValue) {
+							const t = child.nodeValue.replace(/\s+/g, ' ').trim();
+							if (t.length > 1) parts.push(t);
+						}
+					}
+					if (parts.length > 0) {
+						let text = parts.join(' ');
+						if (text.length > ELEMENT_TEXT_MAX_CHARS) text = `${text.slice(0, ELEMENT_TEXT_MAX_CHARS)}…`;
+						treeNode.text = text;
+					}
+				}
 			}
 
 			// Build set of shadow root node IDs to filter them out from children (matches Python)
@@ -2488,6 +2508,9 @@ export class DOMService {
 	 *                      whose index exists in this map will be included in the output.
 	 *                      This ensures the LLM only sees indices that are valid for actions.
 	 */
+	/** Last plain-text line emitted by formatDOMForLLM (dedupes a label repeated by nested wrappers). */
+	private lastEmittedText = '';
+
 	formatDOMForLLM(
 		domTree: DOMTreeNode[],
 		indent: number = 0,
@@ -2495,6 +2518,7 @@ export class DOMService {
 		selectorMap?: Map<number, EnhancedDOMTreeNode>
 	): string {
 		let output = '';
+		if (indent === 0) this.lastEmittedText = '';
 
 		for (const node of domTree) {
 			// Only show interactive elements that exist in the filtered selectorMap
@@ -2622,6 +2646,14 @@ export class DOMService {
 					}
 				} else if (node.hasHiddenContent) {
 					output += `${prefix}\t... (more content below viewport - scroll to reveal)\n`;
+				}
+			}
+
+			if (!node.isInteractive && node.isVisible && node.text && node.text.trim().length > 1) {
+				const t = node.text.trim();
+				if (t !== this.lastEmittedText) {
+					output += `${'\t'.repeat(indent)}${t}\n`;
+					this.lastEmittedText = t;
 				}
 			}
 
