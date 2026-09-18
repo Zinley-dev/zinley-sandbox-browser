@@ -18,6 +18,7 @@
  */
 import type { BrowserSession } from './browser/session.js';
 import type { ActionRegistry, ActionContext } from './actions/registry.js';
+import { z } from 'zod';
 import { DEFAULT_INCLUDE_ATTRIBUTES, getXPath, calculateElementHash } from './dom/views.js';
 
 export interface StepTab {
@@ -348,6 +349,41 @@ async function drawIndexOverlay(page: any, selectorMap: Map<number, any>, only?:
 	}
 }
 
+/**
+ * Actions the step-by-step driver has that the autonomous agent does not.
+ * `hover{index}`: many menus (account, categories, "more") open on mouse-over
+ * only — there was no way to reach them without clicking something else.
+ */
+export function registerStepActions(registry: ActionRegistry): void {
+	if (registry.getAction('hover')) return;
+	registry.register({
+		name: 'hover',
+		description: 'Move the mouse over an element by index (opens hover menus, reveals controls) without clicking it.',
+		paramSchema: z.object({ index: z.number().int().describe('The [index] of the element to hover.') }),
+		function: async (params: { index: number }, context: ActionContext) => {
+			const session: any = context.browserSession;
+			const node: any = await session.getElementByIndex(params.index);
+			if (!node) return { extractedContent: `Element index ${params.index} not available - page may have changed. Try refreshing browser state.` };
+			const p = node.absolutePosition || node.snapshotNode?.bounds;
+			if (!p || !(p.width > 0) || !(p.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
+			const page: any = session.getPageOrCurrent();
+			let x = p.x + p.width / 2;
+			let y = p.y + p.height / 2;
+			if (!node.absolutePosition) {
+				// snapshot bounds are document-relative; the mouse wants viewport coordinates
+				const [sx, sy] = (await page.evaluate('[window.scrollX, window.scrollY]').catch(() => [0, 0])) as number[];
+				x -= sx;
+				y -= sy;
+			}
+			await page.mouse.move(x, y, { steps: 6 });
+			await new Promise(resolve => setTimeout(resolve, 250));
+			const tag = String(node.nodeName || node.tagName || 'element').toLowerCase();
+			const name = String(node.axNode?.name || node.text || '').trim().slice(0, 60);
+			return { extractedContent: `Hovered ${tag}${name ? ` "${name}"` : ''} [${params.index}]`, longTermMemory: `Hovered [${params.index}]` };
+		},
+	} as any);
+}
+
 /** The text block the chat model reads — the same ingredients as the agent's <browser_state>. */
 export function renderStepState(head: string, st: StepState): string {
 	const lines: string[] = [head, `Page: ${st.title || '(untitled)'} — ${st.url || '(no url)'}`];
@@ -545,7 +581,7 @@ async function settleBetweenActions(session: BrowserSession): Promise<void> {
  * a suggestion dropdown — reading the DOM the same millisecond returns the
  * old page and the model acts on stale indices. Bounded (≤ ~2 s), never throws.
  */
-const LIGHT_ACTIONS = new Set(['scroll', 'input', 'select_dropdown', 'dropdown_options', 'find_text', 'search_page', 'find_elements', 'extract', 'wait']);
+const LIGHT_ACTIONS = new Set(['scroll', 'input', 'select_dropdown', 'dropdown_options', 'find_text', 'search_page', 'find_elements', 'extract', 'wait', 'hover']);
 
 export async function settleAfterActions(session: BrowserSession, opts: { light?: boolean; scrolled?: boolean } = {}): Promise<void> {
 	try {

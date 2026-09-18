@@ -33,7 +33,7 @@ import { ActionRegistry, type ActionContext } from '../../browser-use-engine/act
 import { registerBuiltinActions } from '../../browser-use-engine/actions/builtin.js';
 import { ChatSnowX } from '../../browser-use-engine/llm/snowx/chat.js';
 import type { ActionResult } from '../../browser-use-engine/types/agent.js';
-import { captureStepState, runStepActions, settleAfterActions, normalizeUrl, type StepAction } from '../../browser-use-engine/step-state.js';
+import { captureStepState, runStepActions, settleAfterActions, normalizeUrl, registerStepActions, type StepAction } from '../../browser-use-engine/step-state.js';
 
 import {
   ZB_DAEMON_PORT,
@@ -139,6 +139,7 @@ class Daemon {
   private buildRegistry(): ActionRegistry {
     const registry = new ActionRegistry();
     registerBuiltinActions(registry);
+    registerStepActions(registry);
     for (const name of DISABLED_ACTIONS) registry.unregister(name);
     registry.register({
       name: 'request_user_help',

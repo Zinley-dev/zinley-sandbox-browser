@@ -55264,6 +55264,7 @@ var ChatSnowX = class {
 };
 
 // sandbox-runtime/browser-use-engine/step-state.ts
+init_zod();
 init_views();
 async function captureStepState(session, opts = {}) {
   const wantShot = opts.screenshot !== false;
@@ -55513,6 +55514,34 @@ async function drawIndexOverlay(page, selectorMap, only) {
     return false;
   }
 }
+function registerStepActions(registry) {
+  if (registry.getAction("hover")) return;
+  registry.register({
+    name: "hover",
+    description: "Move the mouse over an element by index (opens hover menus, reveals controls) without clicking it.",
+    paramSchema: external_exports.object({ index: external_exports.number().int().describe("The [index] of the element to hover.") }),
+    function: async (params, context) => {
+      const session = context.browserSession;
+      const node = await session.getElementByIndex(params.index);
+      if (!node) return { extractedContent: `Element index ${params.index} not available - page may have changed. Try refreshing browser state.` };
+      const p2 = node.absolutePosition || node.snapshotNode?.bounds;
+      if (!p2 || !(p2.width > 0) || !(p2.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
+      const page = session.getPageOrCurrent();
+      let x2 = p2.x + p2.width / 2;
+      let y2 = p2.y + p2.height / 2;
+      if (!node.absolutePosition) {
+        const [sx, sy] = await page.evaluate("[window.scrollX, window.scrollY]").catch(() => [0, 0]);
+        x2 -= sx;
+        y2 -= sy;
+      }
+      await page.mouse.move(x2, y2, { steps: 6 });
+      await new Promise((resolve3) => setTimeout(resolve3, 250));
+      const tag = String(node.nodeName || node.tagName || "element").toLowerCase();
+      const name = String(node.axNode?.name || node.text || "").trim().slice(0, 60);
+      return { extractedContent: `Hovered ${tag}${name ? ` "${name}"` : ""} [${params.index}]`, longTermMemory: `Hovered [${params.index}]` };
+    }
+  });
+}
 async function runStepActions(session, registry, actions, context, opts = {}) {
   const max = opts.max ?? 5;
   const results = [];
@@ -55630,7 +55659,7 @@ async function settleBetweenActions(session) {
   } catch {
   }
 }
-var LIGHT_ACTIONS = /* @__PURE__ */ new Set(["scroll", "input", "select_dropdown", "dropdown_options", "find_text", "search_page", "find_elements", "extract", "wait"]);
+var LIGHT_ACTIONS = /* @__PURE__ */ new Set(["scroll", "input", "select_dropdown", "dropdown_options", "find_text", "search_page", "find_elements", "extract", "wait", "hover"]);
 async function settleAfterActions(session, opts = {}) {
   try {
     const page = session.getPageOrCurrent();
@@ -55736,6 +55765,7 @@ var Daemon = class {
   buildRegistry() {
     const registry = new ActionRegistry2();
     registerBuiltinActions(registry);
+    registerStepActions(registry);
     for (const name of DISABLED_ACTIONS) registry.unregister(name);
     registry.register({
       name: "request_user_help",
