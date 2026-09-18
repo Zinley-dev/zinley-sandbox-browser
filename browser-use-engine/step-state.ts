@@ -131,6 +131,19 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 			out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(' | ')}`);
 		}
 		if (state.stateError) out.notes.push(String(state.stateError));
+		// Files the browser saved since the last look: the model needs the path
+		// (to read it, attach it, or hand it to the user).
+		try {
+			const files: string[] = Array.isArray((session as any).downloadedFiles) ? (session as any).downloadedFiles : [];
+			const seen = reportedDownloads.get(session as object) ?? 0;
+			if (files.length > seen) {
+				const fresh = files.slice(seen);
+				out.notes.push(`Downloaded ${fresh.length} file(s): ${fresh.join(', ')}`);
+				reportedDownloads.set(session as object, files.length);
+			}
+		} catch {
+			/* best effort */
+		}
 		try {
 			const page: any = session.getPageOrCurrent();
 			const l: any = await page.evaluate(LOADING_PROBE).catch(() => null);
@@ -200,6 +213,18 @@ async function getStateWithPage(session: BrowserSession): Promise<any> {
 }
 
 const lastSeen = new WeakMap<object, { url: string; ids: Set<number> }>();
+/** Downloads already reported to the model, per session. */
+const reportedDownloads = new WeakMap<object, number>();
+
+/** "amazon.com" and "www.lyft.com/ride" are what people type; the browser
+ *  wants a scheme. Leaves anything with a scheme (or a local path) alone. */
+export function normalizeUrl(raw: string): string {
+	const url = String(raw || '').trim();
+	if (!url) return url;
+	if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url; // http:, https:, file:, about:, data:, chrome:
+	if (url.startsWith('/')) return url;
+	return `https://${url}`;
+}
 /** index → identity of the node the model was shown, so a re-rendered page can be re-targeted. */
 interface NodeIdentity { xpath: string; hash: number; tag: string; id: string; name: string }
 const lastNodes = new WeakMap<object, Map<number, NodeIdentity>>();
@@ -391,6 +416,7 @@ export async function runStepActions(
 		}
 		try {
 			let useParams: Record<string, unknown> = { ...(params ?? {}) };
+			if (action === 'navigate' && typeof useParams.url === 'string') useParams.url = normalizeUrl(useParams.url);
 			let retargetNote = '';
 			const isGone = (r: any) => !r?.error && typeof r?.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent);
 			let r = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });

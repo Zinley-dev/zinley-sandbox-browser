@@ -33,7 +33,7 @@ import { ActionRegistry, type ActionContext } from '../../browser-use-engine/act
 import { registerBuiltinActions } from '../../browser-use-engine/actions/builtin.js';
 import { ChatSnowX } from '../../browser-use-engine/llm/snowx/chat.js';
 import type { ActionResult } from '../../browser-use-engine/types/agent.js';
-import { captureStepState, runStepActions, settleAfterActions, type StepAction } from '../../browser-use-engine/step-state.js';
+import { captureStepState, runStepActions, settleAfterActions, normalizeUrl, type StepAction } from '../../browser-use-engine/step-state.js';
 
 import {
   ZB_DAEMON_PORT,
@@ -439,10 +439,21 @@ class Daemon {
         return { ok: false, action: label, error: `'${a.action}' is the browser agent's, not a step — use op="handoff" for the user and just stop calling when you are done.` };
       }
     }
+    // upload_file needs an allow-list; on this box the model's own files (a
+    // form it filled, a PDF it made with Bash) live under the workspace —
+    // those, and only those, are allowed. Anything else is refused by the engine.
+    const uploads = actions
+      .filter(a => a.action === 'upload_file' && typeof (a.params as any)?.path === 'string')
+      .map(a => path.resolve(WORKSPACE, String((a.params as any).path)))
+      .filter(p => p.startsWith(path.resolve(WORKSPACE) + path.sep) && fs.existsSync(p));
+    for (const a of actions) {
+      if (a.action === 'upload_file' && typeof (a.params as any)?.path === 'string') (a.params as any).path = path.resolve(WORKSPACE, String((a.params as any).path));
+    }
     const context: ActionContext = {
       browserSession: session,
       llm: this.token ? this.ensureLlm() : undefined,
       pageExtractionLlm: this.token ? this.ensureLlm() : undefined,
+      ...(uploads.length > 0 ? { availableFilePaths: uploads } : {}),
     } as ActionContext;
     const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
     for (const r of run.results) if (r.error) this.noteBrowserError(r.error);
@@ -661,7 +672,7 @@ class Daemon {
           let navError: string | undefined;
           if (body?.url && typeof body.url === 'string') {
             try {
-              await session.navigate(body.url);
+              await session.navigate(normalizeUrl(body.url));
             } catch (err: any) {
               navError = `Opening ${body.url} did not complete (${String(err?.message || err).slice(0, 100)}) — the page below is what the browser shows now.`;
             }

@@ -18473,7 +18473,7 @@ var require_lib3 = __commonJS({
       let accum = [];
       let accumBytes = 0;
       let abort = false;
-      return new Body.Promise(function(resolve2, reject) {
+      return new Body.Promise(function(resolve3, reject) {
         let resTimeout;
         if (_this4.timeout) {
           resTimeout = setTimeout(function() {
@@ -18507,7 +18507,7 @@ var require_lib3 = __commonJS({
           }
           clearTimeout(resTimeout);
           try {
-            resolve2(Buffer.concat(accum, accumBytes));
+            resolve3(Buffer.concat(accum, accumBytes));
           } catch (err) {
             reject(new FetchError(`Could not create Buffer from response body for ${_this4.url}: ${err.message}`, "system", err));
           }
@@ -19182,7 +19182,7 @@ var require_lib3 = __commonJS({
         throw new Error("native promise missing, set fetch.Promise to your favorite alternative");
       }
       Body.Promise = fetch3.Promise;
-      return new fetch3.Promise(function(resolve2, reject) {
+      return new fetch3.Promise(function(resolve3, reject) {
         const request = new Request3(url, opts);
         const options = getNodeRequestOptions(request);
         const send2 = (options.protocol === "https:" ? https : http2).request;
@@ -19315,7 +19315,7 @@ var require_lib3 = __commonJS({
                   requestOpts.body = void 0;
                   requestOpts.headers.delete("content-length");
                 }
-                resolve2(fetch3(new Request3(locationURL, requestOpts)));
+                resolve3(fetch3(new Request3(locationURL, requestOpts)));
                 finalize();
                 return;
             }
@@ -19336,7 +19336,7 @@ var require_lib3 = __commonJS({
           const codings = headers.get("Content-Encoding");
           if (!request.compress || request.method === "HEAD" || codings === null || res.statusCode === 204 || res.statusCode === 304) {
             response = new Response3(body, response_options);
-            resolve2(response);
+            resolve3(response);
             return;
           }
           const zlibOptions = {
@@ -19346,7 +19346,7 @@ var require_lib3 = __commonJS({
           if (codings == "gzip" || codings == "x-gzip") {
             body = body.pipe(zlib2.createGunzip(zlibOptions));
             response = new Response3(body, response_options);
-            resolve2(response);
+            resolve3(response);
             return;
           }
           if (codings == "deflate" || codings == "x-deflate") {
@@ -19358,12 +19358,12 @@ var require_lib3 = __commonJS({
                 body = body.pipe(zlib2.createInflateRaw());
               }
               response = new Response3(body, response_options);
-              resolve2(response);
+              resolve3(response);
             });
             raw.on("end", function() {
               if (!response) {
                 response = new Response3(body, response_options);
-                resolve2(response);
+                resolve3(response);
               }
             });
             return;
@@ -19371,11 +19371,11 @@ var require_lib3 = __commonJS({
           if (codings == "br" && typeof zlib2.createBrotliDecompress === "function") {
             body = body.pipe(zlib2.createBrotliDecompress());
             response = new Response3(body, response_options);
-            resolve2(response);
+            resolve3(response);
             return;
           }
           response = new Response3(body, response_options);
-          resolve2(response);
+          resolve3(response);
         });
         writeToStream(req, request);
       });
@@ -26347,14 +26347,14 @@ var require_async_iterator = __commonJS({
       };
     }
     function readAndResolve(iter) {
-      var resolve2 = iter[kLastResolve];
-      if (resolve2 !== null) {
+      var resolve3 = iter[kLastResolve];
+      if (resolve3 !== null) {
         var data = iter[kStream].read();
         if (data !== null) {
           iter[kLastPromise] = null;
           iter[kLastResolve] = null;
           iter[kLastReject] = null;
-          resolve2(createIterResult(data, false));
+          resolve3(createIterResult(data, false));
         }
       }
     }
@@ -26362,13 +26362,13 @@ var require_async_iterator = __commonJS({
       process.nextTick(readAndResolve, iter);
     }
     function wrapForNext(lastPromise, iter) {
-      return function(resolve2, reject) {
+      return function(resolve3, reject) {
         lastPromise.then(function() {
           if (iter[kEnded]) {
-            resolve2(createIterResult(void 0, true));
+            resolve3(createIterResult(void 0, true));
             return;
           }
-          iter[kHandlePromise](resolve2, reject);
+          iter[kHandlePromise](resolve3, reject);
         }, reject);
       };
     }
@@ -26388,12 +26388,12 @@ var require_async_iterator = __commonJS({
           return Promise.resolve(createIterResult(void 0, true));
         }
         if (this[kStream].destroyed) {
-          return new Promise(function(resolve2, reject) {
+          return new Promise(function(resolve3, reject) {
             process.nextTick(function() {
               if (_this[kError]) {
                 reject(_this[kError]);
               } else {
-                resolve2(createIterResult(void 0, true));
+                resolve3(createIterResult(void 0, true));
               }
             });
           });
@@ -26416,13 +26416,13 @@ var require_async_iterator = __commonJS({
       return this;
     }), _defineProperty(_Object$setPrototypeO, "return", function _return() {
       var _this2 = this;
-      return new Promise(function(resolve2, reject) {
+      return new Promise(function(resolve3, reject) {
         _this2[kStream].destroy(null, function(err) {
           if (err) {
             reject(err);
             return;
           }
-          resolve2(createIterResult(void 0, true));
+          resolve3(createIterResult(void 0, true));
         });
       });
     }), _Object$setPrototypeO), AsyncIteratorPrototype);
@@ -26444,15 +26444,15 @@ var require_async_iterator = __commonJS({
         value: stream._readableState.endEmitted,
         writable: true
       }), _defineProperty(_Object$create, kHandlePromise, {
-        value: function value(resolve2, reject) {
+        value: function value(resolve3, reject) {
           var data = iterator[kStream].read();
           if (data) {
             iterator[kLastPromise] = null;
             iterator[kLastResolve] = null;
             iterator[kLastReject] = null;
-            resolve2(createIterResult(data, false));
+            resolve3(createIterResult(data, false));
           } else {
-            iterator[kLastResolve] = resolve2;
+            iterator[kLastResolve] = resolve3;
             iterator[kLastReject] = reject;
           }
         },
@@ -26471,12 +26471,12 @@ var require_async_iterator = __commonJS({
           iterator[kError] = err;
           return;
         }
-        var resolve2 = iterator[kLastResolve];
-        if (resolve2 !== null) {
+        var resolve3 = iterator[kLastResolve];
+        if (resolve3 !== null) {
           iterator[kLastPromise] = null;
           iterator[kLastResolve] = null;
           iterator[kLastReject] = null;
-          resolve2(createIterResult(void 0, true));
+          resolve3(createIterResult(void 0, true));
         }
         iterator[kEnded] = true;
       });
@@ -26491,7 +26491,7 @@ var require_async_iterator = __commonJS({
 var require_from = __commonJS({
   "../../../../../../../Users/khoinguyen/Desktop/snowx-api-v2-zin284/node_modules/.pnpm/readable-stream@3.6.2/node_modules/readable-stream/lib/internal/streams/from.js"(exports2, module2) {
     "use strict";
-    function asyncGeneratorStep(gen, resolve2, reject, _next, _throw, key, arg) {
+    function asyncGeneratorStep(gen, resolve3, reject, _next, _throw, key, arg) {
       try {
         var info = gen[key](arg);
         var value = info.value;
@@ -26500,7 +26500,7 @@ var require_from = __commonJS({
         return;
       }
       if (info.done) {
-        resolve2(value);
+        resolve3(value);
       } else {
         Promise.resolve(value).then(_next, _throw);
       }
@@ -26508,13 +26508,13 @@ var require_from = __commonJS({
     function _asyncToGenerator(fn) {
       return function() {
         var self2 = this, args = arguments;
-        return new Promise(function(resolve2, reject) {
+        return new Promise(function(resolve3, reject) {
           var gen = fn.apply(self2, args);
           function _next(value) {
-            asyncGeneratorStep(gen, resolve2, reject, _next, _throw, "next", value);
+            asyncGeneratorStep(gen, resolve3, reject, _next, _throw, "next", value);
           }
           function _throw(err) {
-            asyncGeneratorStep(gen, resolve2, reject, _next, _throw, "throw", err);
+            asyncGeneratorStep(gen, resolve3, reject, _next, _throw, "throw", err);
           }
           _next(void 0);
         });
@@ -28351,10 +28351,10 @@ var require_awaitify = __commonJS({
         if (typeof args[arity - 1] === "function") {
           return asyncFn.apply(this, args);
         }
-        return new Promise((resolve2, reject) => {
+        return new Promise((resolve3, reject) => {
           args[arity - 1] = (err, ...cbArgs) => {
             if (err) return reject(err);
-            resolve2(cbArgs.length > 1 ? cbArgs : cbArgs[0]);
+            resolve3(cbArgs.length > 1 ? cbArgs : cbArgs[0]);
           };
           asyncFn.apply(this, args);
         });
@@ -28983,13 +28983,13 @@ var require_diagnostics = __commonJS({
         if (adapters[i2](namespace)) return true;
       }
       if (!async.length) return false;
-      return new Promise(function pinky(resolve2) {
+      return new Promise(function pinky(resolve3) {
         Promise.all(
           async.map(function prebind(fn) {
             return fn(namespace);
           })
         ).then(function resolved(values) {
-          resolve2(values.some(Boolean));
+          resolve3(values.some(Boolean));
         });
       });
     }
@@ -33806,7 +33806,7 @@ var EventBus = class extends import_index.default {
    */
   async dispatch(eventName, payload, timeout) {
     const eventId = `${eventName}_${Date.now()}_${Math.random()}`;
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       let timeoutHandle;
       if (timeout && timeout > 0) {
         timeoutHandle = setTimeout(() => {
@@ -33814,7 +33814,7 @@ var EventBus = class extends import_index.default {
           reject(new Error(`Event ${eventName} timed out after ${timeout}s`));
         }, timeout * 1e3);
       }
-      this.pendingEvents.set(eventId, { resolve: resolve2, reject, timeout: timeoutHandle });
+      this.pendingEvents.set(eventId, { resolve: resolve3, reject, timeout: timeoutHandle });
       this.emit(eventName, { ...payload, _eventId: eventId });
     });
   }
@@ -36935,10 +36935,10 @@ var BrowserSession = class {
           console.debug(`\u2705 Page ready: readyState=${pageStatus.readyState}, pending=${pageStatus.pendingRequests}, elements=${pageStatus.elementCount}, stable=${stableCount}`);
           return { ready: true, pendingRequests: pageStatus.pendingRequests, readyState: pageStatus.readyState, elementCount: pageStatus.elementCount };
         }
-        await new Promise((resolve2) => setTimeout(resolve2, 100));
+        await new Promise((resolve3) => setTimeout(resolve3, 100));
       } catch (error) {
         stableCount = 0;
-        await new Promise((resolve2) => setTimeout(resolve2, 100));
+        await new Promise((resolve3) => setTimeout(resolve3, 100));
       }
     }
     console.debug(`\u26A0\uFE0F Page readiness timeout: readyState=${lastReadyState}, pending=${lastPendingCount}, elements=${lastElementCount}, stable=${stableCount}`);
@@ -36958,7 +36958,7 @@ var BrowserSession = class {
     if (!readinessResult.ready) {
       console.debug(`\u26A0\uFE0F Proceeding with DOM extraction despite page not fully ready (readyState=${readinessResult.readyState})`);
       if (readinessResult.pendingRequests > 0) {
-        await new Promise((resolve2) => setTimeout(resolve2, 300));
+        await new Promise((resolve3) => setTimeout(resolve3, 300));
       }
     }
     const scrollInfo = await page.evaluate(() => {
@@ -37216,7 +37216,7 @@ var BrowserSession = class {
       } else {
         idleStartTime = null;
       }
-      await new Promise((resolve2) => setTimeout(resolve2, config.pollInterval * 1e3));
+      await new Promise((resolve3) => setTimeout(resolve3, config.pollInterval * 1e3));
     }
   }
   /**
@@ -38247,7 +38247,7 @@ var BrowserSession = class {
       if (event.node && event.node.backendNodeId) {
         const success = await this.scrollElementContainer(event.node, pixels, pageId);
         if (success) {
-          await new Promise((resolve2) => setTimeout(resolve2, 150));
+          await new Promise((resolve3) => setTimeout(resolve3, 150));
           this.eventBus.respondToEvent(event._eventId, null);
           return;
         }
@@ -38256,7 +38256,7 @@ var BrowserSession = class {
       const deltaY = event.direction === "down" ? event.amount : -event.amount;
       const deltaX = event.direction === "right" ? event.amount : event.direction === "left" ? -event.amount : 0;
       await page.mouse.wheel(deltaX, deltaY);
-      await new Promise((resolve2) => setTimeout(resolve2, 150));
+      await new Promise((resolve3) => setTimeout(resolve3, 150));
       this.eventBus.respondToEvent(event._eventId, null);
     } catch (error) {
       this.eventBus.rejectEvent(event._eventId, error);
@@ -38667,7 +38667,7 @@ var BrowserSession = class {
       const maxWait = event.maxSeconds || 60;
       const seconds = Math.min(event.seconds, maxWait);
       console.debug(`Waiting for ${seconds}s (requested: ${event.seconds}s, max: ${maxWait}s)`);
-      await new Promise((resolve2) => setTimeout(resolve2, seconds * 1e3));
+      await new Promise((resolve3) => setTimeout(resolve3, seconds * 1e3));
       this.eventBus.respondToEvent(event._eventId, null);
     } catch (error) {
       this.eventBus.rejectEvent(event._eventId, error);
@@ -39512,7 +39512,7 @@ var BrowserSession = class {
     try {
       const page = await this.ensurePage();
       await this.removeHighlights();
-      await new Promise((resolve2) => setTimeout(resolve2, 50));
+      await new Promise((resolve3) => setTimeout(resolve3, 50));
       const highlights = [];
       for (const [index, node] of selectorMap.entries()) {
         if (node.absolutePosition) {
@@ -42216,8 +42216,8 @@ var PdfFile = class extends BaseFile {
       const doc = new PDFDocument();
       const chunks = [];
       doc.on("data", (chunk) => chunks.push(chunk));
-      const pdfPromise = new Promise((resolve2) => {
-        doc.on("end", () => resolve2(Buffer.concat(chunks)));
+      const pdfPromise = new Promise((resolve3) => {
+        doc.on("end", () => resolve3(Buffer.concat(chunks)));
       });
       const headingSizes = {
         1: fontSizesNumeric["2xl"],
@@ -43302,7 +43302,7 @@ var SCROLL_STEP_DELAY_MS = 150;
 var EMPTY_DOM_RECHECK_DELAY_MS = 3e3;
 var EMPTY_DOM_RELOAD_WAIT_MS = 5e3;
 var PDF_PRINT_TIMEOUT_MS = 3e4;
-var sleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var sleep = (ms) => new Promise((resolve3) => setTimeout(resolve3, ms));
 async function getElementForContext(context, index) {
   if (context.pageId) {
     return context.browserSession.getElementByIndexForPage(context.pageId, index);
@@ -46856,7 +46856,7 @@ var Agent = class _Agent {
             if (this.pausePromise) {
               await this.pausePromise;
             } else {
-              await new Promise((resolve2) => setTimeout(resolve2, 100));
+              await new Promise((resolve3) => setTimeout(resolve3, 100));
             }
           }
           console.log("\u25B6\uFE0F Agent resumed, continuing...");
@@ -47208,8 +47208,8 @@ What is your next action?`;
     console.log("\u23F8\uFE0F  Pausing agent...");
     this.state.paused = true;
     if (!this.pausePromise) {
-      this.pausePromise = new Promise((resolve2) => {
-        this.pauseResolve = resolve2;
+      this.pausePromise = new Promise((resolve3) => {
+        this.pauseResolve = resolve3;
       });
     }
   }
@@ -47262,7 +47262,7 @@ What is your next action?`;
       }
       if (i2 > 0) {
         const waitTime = this.settings.waitBetweenActions;
-        await new Promise((resolve2) => setTimeout(resolve2, waitTime * 1e3));
+        await new Promise((resolve3) => setTimeout(resolve3, waitTime * 1e3));
       }
       try {
         await this._checkStopOrPause();
@@ -48104,7 +48104,7 @@ ${lastResult.extractedContent}
         this.MAX_RETRY_DELAY
       );
       console.log(`\u23F3 Waiting ${retryDelay.toFixed(1)}s before retry (exponential backoff)`);
-      await new Promise((resolve2) => setTimeout(resolve2, retryDelay * 1e3));
+      await new Promise((resolve3) => setTimeout(resolve3, retryDelay * 1e3));
     }
   }
   /**
@@ -48472,7 +48472,7 @@ Include everything you found out for the ultimate task in the done text.`;
    * Sleep helper
    */
   _sleep(ms) {
-    return new Promise((resolve2) => setTimeout(resolve2, ms));
+    return new Promise((resolve3) => setTimeout(resolve3, ms));
   }
   /**
    * Replace long URLs in text with shortened versions to reduce token usage.
@@ -50225,8 +50225,8 @@ function _addRequestID(value, response) {
 }
 var APIPromise = class _APIPromise extends Promise {
   constructor(responsePromise, parseResponse2 = defaultParseResponse) {
-    super((resolve2) => {
-      resolve2(null);
+    super((resolve3) => {
+      resolve3(null);
     });
     this.responsePromise = responsePromise;
     this.parseResponse = parseResponse2;
@@ -50801,7 +50801,7 @@ var startsWithSchemeRegexp = /^[a-z][a-z0-9+.-]*:/i;
 var isAbsoluteURL = (url) => {
   return startsWithSchemeRegexp.test(url);
 };
-var sleep2 = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+var sleep2 = (ms) => new Promise((resolve3) => setTimeout(resolve3, ms));
 var validatePositiveInteger = (name, n2) => {
   if (typeof n2 !== "number" || !Number.isInteger(n2)) {
     throw new OpenAIError(`${name} must be an integer`);
@@ -51273,12 +51273,12 @@ var EventStream = class {
     _EventStream_errored.set(this, false);
     _EventStream_aborted.set(this, false);
     _EventStream_catchingPromiseCreated.set(this, false);
-    __classPrivateFieldSet7(this, _EventStream_connectedPromise, new Promise((resolve2, reject) => {
-      __classPrivateFieldSet7(this, _EventStream_resolveConnectedPromise, resolve2, "f");
+    __classPrivateFieldSet7(this, _EventStream_connectedPromise, new Promise((resolve3, reject) => {
+      __classPrivateFieldSet7(this, _EventStream_resolveConnectedPromise, resolve3, "f");
       __classPrivateFieldSet7(this, _EventStream_rejectConnectedPromise, reject, "f");
     }), "f");
-    __classPrivateFieldSet7(this, _EventStream_endPromise, new Promise((resolve2, reject) => {
-      __classPrivateFieldSet7(this, _EventStream_resolveEndPromise, resolve2, "f");
+    __classPrivateFieldSet7(this, _EventStream_endPromise, new Promise((resolve3, reject) => {
+      __classPrivateFieldSet7(this, _EventStream_resolveEndPromise, resolve3, "f");
       __classPrivateFieldSet7(this, _EventStream_rejectEndPromise, reject, "f");
     }), "f");
     __classPrivateFieldGet8(this, _EventStream_connectedPromise, "f").catch(() => {
@@ -51362,11 +51362,11 @@ var EventStream = class {
    *   const message = await stream.emitted('message') // rejects if the stream errors
    */
   emitted(event) {
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve3, reject) => {
       __classPrivateFieldSet7(this, _EventStream_catchingPromiseCreated, true, "f");
       if (event !== "error")
         this.once("error", reject);
-      this.once(event, resolve2);
+      this.once(event, resolve3);
     });
   }
   async done() {
@@ -52490,7 +52490,7 @@ var ChatCompletionStream = class _ChatCompletionStream extends AbstractChatCompl
           if (done2) {
             return { value: void 0, done: true };
           }
-          return new Promise((resolve2, reject) => readQueue.push({ resolve: resolve2, reject })).then((chunk2) => chunk2 ? { value: chunk2, done: false } : { value: void 0, done: true });
+          return new Promise((resolve3, reject) => readQueue.push({ resolve: resolve3, reject })).then((chunk2) => chunk2 ? { value: chunk2, done: false } : { value: void 0, done: true });
         }
         const chunk = pushQueue.shift();
         return { value: chunk, done: false };
@@ -52815,7 +52815,7 @@ var AssistantStream = class _AssistantStream extends EventStream {
           if (done2) {
             return { value: void 0, done: true };
           }
-          return new Promise((resolve2, reject) => readQueue.push({ resolve: resolve2, reject })).then((chunk2) => chunk2 ? { value: chunk2, done: false } : { value: void 0, done: true });
+          return new Promise((resolve3, reject) => readQueue.push({ resolve: resolve3, reject })).then((chunk2) => chunk2 ? { value: chunk2, done: false } : { value: void 0, done: true });
         }
         const chunk = pushQueue.shift();
         return { value: chunk, done: false };
@@ -54367,7 +54367,7 @@ var ResponseStream = class _ResponseStream extends EventStream {
           if (done2) {
             return { value: void 0, done: true };
           }
-          return new Promise((resolve2, reject) => readQueue.push({ resolve: resolve2, reject })).then((event2) => event2 ? { value: event2, done: false } : { value: void 0, done: true });
+          return new Promise((resolve3, reject) => readQueue.push({ resolve: resolve3, reject })).then((event2) => event2 ? { value: event2, done: false } : { value: void 0, done: true });
         }
         const event = pushQueue.shift();
         return { value: event, done: false };
@@ -55346,6 +55346,16 @@ ${elements}`;
     }
     if (state.stateError) out.notes.push(String(state.stateError));
     try {
+      const files = Array.isArray(session.downloadedFiles) ? session.downloadedFiles : [];
+      const seen = reportedDownloads.get(session) ?? 0;
+      if (files.length > seen) {
+        const fresh = files.slice(seen);
+        out.notes.push(`Downloaded ${fresh.length} file(s): ${fresh.join(", ")}`);
+        reportedDownloads.set(session, files.length);
+      }
+    } catch {
+    }
+    try {
       const page = session.getPageOrCurrent();
       const l2 = await page.evaluate(LOADING_PROBE).catch(() => null);
       if (l2 && (l2.indicator || l2.pending > 2 || l2.ready === "loading")) {
@@ -55400,6 +55410,14 @@ async function getStateWithPage(session) {
   }
 }
 var lastSeen = /* @__PURE__ */ new WeakMap();
+var reportedDownloads = /* @__PURE__ */ new WeakMap();
+function normalizeUrl(raw) {
+  const url = String(raw || "").trim();
+  if (!url) return url;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url;
+  if (url.startsWith("/")) return url;
+  return `https://${url}`;
+}
 var lastNodes = /* @__PURE__ */ new WeakMap();
 function identityOf(node) {
   let xpath = "";
@@ -55511,6 +55529,7 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
     }
     try {
       let useParams = { ...params ?? {} };
+      if (action === "navigate" && typeof useParams.url === "string") useParams.url = normalizeUrl(useParams.url);
       let retargetNote = "";
       const isGone = (r3) => !r3?.error && typeof r3?.extractedContent === "string" && /^Element index \d+ not available/.test(r3.extractedContent);
       let r2 = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
@@ -55602,7 +55621,7 @@ async function retarget(session, index) {
 }
 async function settleBetweenActions(session) {
   try {
-    await new Promise((resolve2) => setTimeout(resolve2, 300));
+    await new Promise((resolve3) => setTimeout(resolve3, 300));
     const page = session.getPageOrCurrent();
     await page.waitForLoadState("domcontentloaded", { timeout: 1500 }).catch(() => void 0);
   } catch {
@@ -55613,7 +55632,7 @@ async function settleAfterActions(session, opts = {}) {
   try {
     const page = session.getPageOrCurrent();
     if (opts.light) {
-      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await new Promise((resolve3) => setTimeout(resolve3, 250));
       await waitUntilStable(page, { maxMs: opts.scrolled ? 1500 : 900, intervalMs: 300 });
       return;
     }
@@ -55636,7 +55655,7 @@ async function waitUntilStable(page, opts = {}) {
       const cur = String(await page.evaluate(STABLE_PROBE).catch(() => ""));
       if (cur && cur === last && cur.startsWith("complete")) return;
       last = cur;
-      await new Promise((resolve2) => setTimeout(resolve2, intervalMs));
+      await new Promise((resolve3) => setTimeout(resolve3, intervalMs));
     }
   } catch {
   }
@@ -55987,10 +56006,15 @@ var Daemon = class {
         return { ok: false, action: label, error: `'${a2.action}' is the browser agent's, not a step \u2014 use op="handoff" for the user and just stop calling when you are done.` };
       }
     }
+    const uploads = actions.filter((a2) => a2.action === "upload_file" && typeof a2.params?.path === "string").map((a2) => path10.resolve(WORKSPACE, String(a2.params.path))).filter((p2) => p2.startsWith(path10.resolve(WORKSPACE) + path10.sep) && fs11.existsSync(p2));
+    for (const a2 of actions) {
+      if (a2.action === "upload_file" && typeof a2.params?.path === "string") a2.params.path = path10.resolve(WORKSPACE, String(a2.params.path));
+    }
     const context = {
       browserSession: session,
       llm: this.token ? this.ensureLlm() : void 0,
-      pageExtractionLlm: this.token ? this.ensureLlm() : void 0
+      pageExtractionLlm: this.token ? this.ensureLlm() : void 0,
+      ...uploads.length > 0 ? { availableFilePaths: uploads } : {}
     };
     const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
     for (const r2 of run.results) if (r2.error) this.noteBrowserError(r2.error);
@@ -56094,16 +56118,16 @@ var Daemon = class {
     const settled = () => t2.status === "done" || t2.status === "failed" || t2.status === "stopped" || t2.status === "paused";
     if (settled() || waitMs <= 0) return this.snapshot(t2);
     const startStep = t2.step;
-    await new Promise((resolve2) => {
-      const timer = setTimeout(resolve2, waitMs);
+    await new Promise((resolve3) => {
+      const timer = setTimeout(resolve3, waitMs);
       t2.waiters.push(() => {
         if (settled() || t2.step !== startStep) {
           clearTimeout(timer);
-          resolve2();
+          resolve3();
         } else {
           t2.waiters.push(() => {
             clearTimeout(timer);
-            resolve2();
+            resolve3();
           });
         }
       });
@@ -56182,7 +56206,7 @@ var Daemon = class {
           let navError;
           if (body?.url && typeof body.url === "string") {
             try {
-              await session.navigate(body.url);
+              await session.navigate(normalizeUrl(body.url));
             } catch (err) {
               navError = `Opening ${body.url} did not complete (${String(err?.message || err).slice(0, 100)}) \u2014 the page below is what the browser shows now.`;
             }
