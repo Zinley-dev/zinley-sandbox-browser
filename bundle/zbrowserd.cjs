@@ -55305,6 +55305,12 @@ async function captureStepState(session, opts = {}) {
     let elements = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "", selectorMap);
     if (lastDelta) out.delta = lastDelta;
     const memo = loopMemo.get(session) ?? { url: "", stuck: 0, sameFail: 0 };
+    if (memo.at && Date.now() - memo.at > LOOP_MEMO_GAP_MS) {
+      memo.stuck = 0;
+      memo.sameFail = 0;
+      memo.lastFailKey = void 0;
+    }
+    memo.at = Date.now();
     memo.stuck = memo.url === out.url && /nothing new/.test(lastDelta || "") ? memo.stuck + 1 : 0;
     memo.url = out.url;
     loopMemo.set(session, memo);
@@ -55359,9 +55365,9 @@ ${elements}`;
     try {
       const page = session.getPageOrCurrent();
       const l2 = await page.evaluate(LOADING_PROBE).catch(() => null);
-      if (l2 && (l2.indicator || l2.pending > 2 || l2.ready === "loading")) {
+      if (l2 && (l2.indicator || l2.ready === "loading")) {
         out.notes.push(
-          `Page still loading (${l2.indicator ? "a loading indicator is visible" : `${l2.pending} requests in flight`}) \u2014 what you see may be incomplete: wait{seconds:2} then op="state" before acting on it.`
+          `Page still loading (${l2.indicator ? "a loading indicator is visible" : "the document is still loading"}) \u2014 what you see may be incomplete: wait{seconds:2} then op="state" before acting on it.`
         );
       }
     } catch {
@@ -55415,11 +55421,27 @@ var reportedDownloads = /* @__PURE__ */ new WeakMap();
 function normalizeUrl(raw) {
   const url = String(raw || "").trim();
   if (!url) return url;
+  if (/^[a-z][a-z0-9+.-]*:\d+(?:[/?#]|$)/i.test(url)) return `https://${url}`;
   if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url;
   if (url.startsWith("/")) return url;
   return `https://${url}`;
 }
 var lastNodes = /* @__PURE__ */ new WeakMap();
+function groupKey(i2) {
+  return i2.hash ? `h:${i2.hash}` : `n:${i2.tag}|${i2.name}`;
+}
+function ordinalsOf(map) {
+  const groups = /* @__PURE__ */ new Map();
+  for (const [index, ident] of [...map.entries()].sort((a2, b2) => a2[0] - b2[0])) {
+    const key = groupKey(ident);
+    const g2 = groups.get(key) ?? [];
+    g2.push(index);
+    groups.set(key, g2);
+  }
+  const out = /* @__PURE__ */ new Map();
+  for (const [key, list] of groups) list.forEach((index, ordinal) => out.set(index, { key, ordinal, count: list.length }));
+  return out;
+}
 function identityOf(node) {
   let xpath = "";
   let hash = 0;
@@ -55436,6 +55458,7 @@ function identityOf(node) {
 }
 var loopMemo = /* @__PURE__ */ new WeakMap();
 var STUCK_EVERY = 4;
+var LOOP_MEMO_GAP_MS = 5 * 6e4;
 var lastDelta;
 var INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
 function markNewElements(session, url, elements, selectorMap) {
@@ -55524,15 +55547,32 @@ function registerStepActions(registry) {
       const session = context.browserSession;
       const node = await session.getElementByIndex(params.index);
       if (!node) return { extractedContent: `Element index ${params.index} not available - page may have changed. Try refreshing browser state.` };
-      const p2 = node.absolutePosition || node.snapshotNode?.bounds;
-      if (!p2 || !(p2.width > 0) || !(p2.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
       const page = session.getPageOrCurrent();
-      let x2 = p2.x + p2.width / 2;
-      let y2 = p2.y + p2.height / 2;
-      if (!node.absolutePosition) {
-        const [sx, sy] = await page.evaluate("[window.scrollX, window.scrollY]").catch(() => [0, 0]);
-        x2 -= sx;
-        y2 -= sy;
+      let x2;
+      let y2;
+      try {
+        const cdp = typeof session.getCdpSession === "function" ? await session.getCdpSession() : null;
+        if (cdp && node.backendNodeId) {
+          await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: node.backendNodeId }).catch(() => void 0);
+          const q2 = await cdp.send("DOM.getContentQuads", { backendNodeId: node.backendNodeId }).catch(() => null);
+          const quad = q2?.quads?.[0];
+          if (quad && quad.length >= 8) {
+            x2 = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+            y2 = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+          }
+        }
+      } catch {
+      }
+      if (x2 === void 0 || y2 === void 0) {
+        const p2 = node.absolutePosition || node.snapshotNode?.bounds;
+        if (!p2 || !(p2.width > 0) || !(p2.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
+        x2 = p2.x + p2.width / 2;
+        y2 = p2.y + p2.height / 2;
+        if (!node.absolutePosition) {
+          const [sx, sy] = await page.evaluate("[window.scrollX, window.scrollY]").catch(() => [0, 0]);
+          x2 -= sx;
+          y2 -= sy;
+        }
       }
       await page.mouse.move(x2, y2, { steps: 6 });
       await new Promise((resolve3) => setTimeout(resolve3, 250));
@@ -55560,7 +55600,7 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
       let useParams = { ...params ?? {} };
       if (action === "navigate" && typeof useParams.url === "string") useParams.url = normalizeUrl(useParams.url);
       let retargetNote = "";
-      const isGone = (r3) => !r3?.error && typeof r3?.extractedContent === "string" && /^Element index \d+ not available/.test(r3.extractedContent);
+      const isGone = (r3) => !r3?.error && typeof r3?.extractedContent === "string" && /^Element index \d+ not available/.test(r3.extractedContent) || typeof r3?.error === "string" && /^Element (?:index |with index )?\d+ not (?:available|found)/i.test(r3.error);
       let r2 = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
       if (isGone(r2) && typeof useParams.index === "number") {
         const again = await retarget(session, useParams.index);
@@ -55634,22 +55674,21 @@ async function retarget(session, index) {
   const map = state?.domState?.selectorMap;
   if (!map) return null;
   if (map.has(index)) return { index, how: "still present" };
-  const byHash = [];
-  const byXpath = [];
-  const byId = [];
-  const byName = [];
-  for (const [i2, node] of map.entries()) {
-    const cur = identityOf(node);
-    if (ident.hash && cur.hash === ident.hash) byHash.push(i2);
-    if (ident.xpath && cur.xpath === ident.xpath) byXpath.push(i2);
-    if (ident.id && cur.tag === ident.tag && cur.id === ident.id) byId.push(i2);
-    if (ident.name && cur.tag === ident.tag && cur.name === ident.name) byName.push(i2);
+  const oldMap = lastNodes.get(session);
+  const newMap = /* @__PURE__ */ new Map();
+  for (const [i2, node] of map.entries()) newMap.set(i2, identityOf(node));
+  if (ident.id) {
+    const byId = [...newMap.entries()].filter(([, c2]) => c2.tag === ident.tag && c2.id === ident.id).map(([i2]) => i2);
+    if (byId.length === 1) return { index: byId[0], how: `same #${ident.id} after a re-render` };
   }
-  if (byHash.length === 1) return { index: byHash[0], how: "same element after a re-render" };
-  if (byId.length === 1) return { index: byId[0], how: `same #${ident.id} after a re-render` };
-  if (byXpath.length === 1) return { index: byXpath[0], how: "same place in the page after a re-render" };
-  if (byName.length === 1) return { index: byName[0], how: `the only <${ident.tag}> named "${ident.name}" after a re-render` };
-  return null;
+  const before = ordinalsOf(oldMap).get(index);
+  if (!before) return null;
+  const after = ordinalsOf(newMap);
+  const candidates = [...after.entries()].filter(([, o2]) => o2.key === before.key).sort((a2, b2) => a2[1].ordinal - b2[1].ordinal);
+  if (candidates.length !== before.count) return null;
+  const pick = candidates[before.ordinal];
+  if (!pick) return null;
+  return { index: pick[0], how: before.count === 1 ? "same element after a re-render" : `same element (${before.ordinal + 1} of ${before.count} alike) after a re-render` };
 }
 async function settleBetweenActions(session) {
   try {
@@ -55677,11 +55716,10 @@ async function settleAfterActions(session, opts = {}) {
 }
 var STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n; })()`;
 var LOADING_PROBE = `(() => {
-	// Only requests that STARTED recently and have not finished: a long-poll,
-	// an event stream or a websocket-ish request never ends and would say
-	// "still loading" forever on any page with a live feed.
-	const t = performance.now();
-	const pending = performance.getEntriesByType('resource').filter(e => e.responseEnd === 0 && t - e.startTime < 5000).length;
+	// In-flight requests are not observable from page JS (Resource Timing only
+	// records a request once it completed or failed), so the signals are the
+	// document state and a visible, animated or self-describing indicator.
+	const pending = 0;
 	// A visible indicator whose class is a whole token (spinner / skeleton /
 	// loading / is-loading), never an <img loading="lazy"> or a "loading-lazy"
 	// class that is on the page for good.
@@ -55850,7 +55888,7 @@ var Daemon = class {
    *  session dead so the next call relaunches. */
   noteBrowserError(err) {
     const msg = String(err?.message || err || "");
-    if (/(?:browser|context|page)(?:,| or)? (?:context or browser )?has been closed|Browser closed|Target closed|browserContext\.|Connection closed/i.test(msg)) {
+    if (/(?:browser|context|page)(?:,| or)? (?:context or browser )?has been closed|Browser closed|Target closed|Connection closed|browser has been disconnected/i.test(msg)) {
       if (!this.sessionDead) log(`browser looks dead (${msg.slice(0, 100)}); it will be relaunched on the next call`);
       this.sessionDead = true;
     }
@@ -55923,6 +55961,8 @@ var Daemon = class {
       let blocked = 0;
       await context.route("**/*", (route) => {
         try {
+          const rt2 = String(route.request().resourceType?.() || "");
+          if (rt2 === "document") return route.continue();
           const url = new URL(route.request().url());
           const pageHost = (() => {
             try {
@@ -55931,8 +55971,8 @@ var Daemon = class {
               return "";
             }
           })();
-          const thirdParty = pageHost && !url.hostname.endsWith(pageHost.replace(/^www\./, ""));
-          if (BLOCKED_HOSTS.test(url.hostname) || thirdParty && BLOCKED_PATHS.test(url.pathname)) {
+          const thirdParty = !!pageHost && !url.hostname.endsWith(pageHost.replace(/^www\./, ""));
+          if (thirdParty && (BLOCKED_HOSTS.test(url.hostname) || BLOCKED_PATHS.test(url.pathname))) {
             blocked++;
             return route.abort("blockedbyclient");
           }

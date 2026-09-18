@@ -90,6 +90,12 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		// Several looks at the same page with nothing changing is the model going
 		// in circles (re-reading, re-clicking a dead control). Say it, every few steps.
 		const memo = loopMemo.get(session as object) ?? { url: '', stuck: 0, sameFail: 0 };
+		if (memo.at && Date.now() - memo.at > LOOP_MEMO_GAP_MS) {
+			memo.stuck = 0;
+			memo.sameFail = 0;
+			memo.lastFailKey = undefined;
+		}
+		memo.at = Date.now();
 		memo.stuck = memo.url === out.url && /nothing new/.test(lastDelta || '') ? memo.stuck + 1 : 0;
 		memo.url = out.url;
 		loopMemo.set(session as object, memo);
@@ -148,9 +154,9 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		try {
 			const page: any = session.getPageOrCurrent();
 			const l: any = await page.evaluate(LOADING_PROBE).catch(() => null);
-			if (l && (l.indicator || l.pending > 2 || l.ready === 'loading')) {
+			if (l && (l.indicator || l.ready === 'loading')) {
 				out.notes.push(
-					`Page still loading (${l.indicator ? 'a loading indicator is visible' : `${l.pending} requests in flight`}) — what you see may be incomplete: wait{seconds:2} then op="state" before acting on it.`,
+					`Page still loading (${l.indicator ? 'a loading indicator is visible' : 'the document is still loading'}) — what you see may be incomplete: wait{seconds:2} then op="state" before acting on it.`,
 				);
 			}
 		} catch {
@@ -222,13 +228,31 @@ const reportedDownloads = new WeakMap<object, number>();
 export function normalizeUrl(raw: string): string {
 	const url = String(raw || '').trim();
 	if (!url) return url;
-	if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url; // http:, https:, file:, about:, data:, chrome:
+	if (/^[a-z][a-z0-9+.-]*:\d+(?:[/?#]|$)/i.test(url)) return `https://${url}`; // localhost:3000, example.com:8080/x
+	if (/^[a-z][a-z0-9+.-]*:/i.test(url)) return url; // http:, https:, file:, about:, data:, chrome:, mailto:
 	if (url.startsWith('/')) return url;
 	return `https://${url}`;
 }
 /** index → identity of the node the model was shown, so a re-rendered page can be re-targeted. */
 interface NodeIdentity { xpath: string; hash: number; tag: string; id: string; name: string }
 const lastNodes = new WeakMap<object, Map<number, NodeIdentity>>();
+/** Same-looking controls (two "Remove" buttons) share a hash: remember each
+ *  node's ordinal among its look-alikes so a re-render maps A→A, never A→B. */
+function groupKey(i: NodeIdentity): string {
+	return i.hash ? `h:${i.hash}` : `n:${i.tag}|${i.name}`;
+}
+function ordinalsOf(map: Map<number, NodeIdentity>): Map<number, { key: string; ordinal: number; count: number }> {
+	const groups = new Map<string, number[]>();
+	for (const [index, ident] of [...map.entries()].sort((a, b) => a[0] - b[0])) {
+		const key = groupKey(ident);
+		const g = groups.get(key) ?? [];
+		g.push(index);
+		groups.set(key, g);
+	}
+	const out = new Map<number, { key: string; ordinal: number; count: number }>();
+	for (const [key, list] of groups) list.forEach((index, ordinal) => out.set(index, { key, ordinal, count: list.length }));
+	return out;
+}
 function identityOf(node: any): NodeIdentity {
 	let xpath = '';
 	let hash = 0;
@@ -247,8 +271,11 @@ function identityOf(node: any): NodeIdentity {
 }
 /** Per-session loop awareness: how many captures in a row saw the same page
  *  with nothing new, and the last action that failed (to catch a blind retry). */
-const loopMemo = new WeakMap<object, { url: string; stuck: number; lastFailKey?: string; lastFailUrl?: string; sameFail: number }>();
+const loopMemo = new WeakMap<object, { url: string; stuck: number; lastFailKey?: string; lastFailUrl?: string; sameFail: number; at?: number }>();
 const STUCK_EVERY = 4;
+/** On a session that lives for days (desktop) the counters must not carry a
+ *  previous request's "stuck" into the next one: a gap this long resets them. */
+const LOOP_MEMO_GAP_MS = 5 * 60_000;
 /** Set by markNewElements for the capture in progress (one capture at a time per session). */
 let lastDelta: string | undefined;
 const INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
@@ -364,16 +391,36 @@ export function registerStepActions(registry: ActionRegistry): void {
 			const session: any = context.browserSession;
 			const node: any = await session.getElementByIndex(params.index);
 			if (!node) return { extractedContent: `Element index ${params.index} not available - page may have changed. Try refreshing browser state.` };
-			const p = node.absolutePosition || node.snapshotNode?.bounds;
-			if (!p || !(p.width > 0) || !(p.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
 			const page: any = session.getPageOrCurrent();
-			let x = p.x + p.width / 2;
-			let y = p.y + p.height / 2;
-			if (!node.absolutePosition) {
-				// snapshot bounds are document-relative; the mouse wants viewport coordinates
-				const [sx, sy] = (await page.evaluate('[window.scrollX, window.scrollY]').catch(() => [0, 0])) as number[];
-				x -= sx;
-				y -= sy;
+			let x: number | undefined;
+			let y: number | undefined;
+			// Bring it on screen first (listed elements reach 300 px below the fold)
+			// and take the position from the live layout, like the click path does.
+			try {
+				const cdp: any = typeof session.getCdpSession === 'function' ? await session.getCdpSession() : null;
+				if (cdp && node.backendNodeId) {
+					await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: node.backendNodeId }).catch(() => undefined);
+					const q: any = await cdp.send('DOM.getContentQuads', { backendNodeId: node.backendNodeId }).catch(() => null);
+					const quad: number[] | undefined = q?.quads?.[0];
+					if (quad && quad.length >= 8) {
+						x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4;
+						y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4;
+					}
+				}
+			} catch {
+				/* fall back to the captured position */
+			}
+			if (x === undefined || y === undefined) {
+				const p = node.absolutePosition || node.snapshotNode?.bounds;
+				if (!p || !(p.width > 0) || !(p.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
+				x = p.x + p.width / 2;
+				y = p.y + p.height / 2;
+				if (!node.absolutePosition) {
+					// snapshot bounds are document-relative; the mouse wants viewport coordinates
+					const [sx, sy] = (await page.evaluate('[window.scrollX, window.scrollY]').catch(() => [0, 0])) as number[];
+					x -= sx;
+					y -= sy;
+				}
 			}
 			await page.mouse.move(x, y, { steps: 6 });
 			await new Promise(resolve => setTimeout(resolve, 250));
@@ -454,7 +501,9 @@ export async function runStepActions(
 			let useParams: Record<string, unknown> = { ...(params ?? {}) };
 			if (action === 'navigate' && typeof useParams.url === 'string') useParams.url = normalizeUrl(useParams.url);
 			let retargetNote = '';
-			const isGone = (r: any) => !r?.error && typeof r?.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent);
+			const isGone = (r: any) =>
+				(!r?.error && typeof r?.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent)) ||
+				(typeof r?.error === 'string' && /^Element (?:index |with index )?\d+ not (?:available|found)/i.test(r.error));
 			let r = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
 			// The engine answers a vanished index with a message and NO error
 			// ("Element index 12 not available - page may have changed"). The page
@@ -546,22 +595,25 @@ async function retarget(session: BrowserSession, index: number): Promise<{ index
 	const map: Map<number, any> | undefined = state?.domState?.selectorMap;
 	if (!map) return null;
 	if (map.has(index)) return { index, how: 'still present' };
-	const byHash: number[] = [];
-	const byXpath: number[] = [];
-	const byId: number[] = [];
-	const byName: number[] = [];
-	for (const [i, node] of map.entries()) {
-		const cur = identityOf(node);
-		if (ident.hash && cur.hash === ident.hash) byHash.push(i);
-		if (ident.xpath && cur.xpath === ident.xpath) byXpath.push(i);
-		if (ident.id && cur.tag === ident.tag && cur.id === ident.id) byId.push(i);
-		if (ident.name && cur.tag === ident.tag && cur.name === ident.name) byName.push(i);
+	const oldMap = lastNodes.get(session as object)!;
+	const newMap = new Map<number, NodeIdentity>();
+	for (const [i, node] of map.entries()) newMap.set(i, identityOf(node));
+	// A unique id is the one identity that cannot be mistaken for a sibling.
+	if (ident.id) {
+		const byId = [...newMap.entries()].filter(([, c]) => c.tag === ident.tag && c.id === ident.id).map(([i]) => i);
+		if (byId.length === 1) return { index: byId[0], how: `same #${ident.id} after a re-render` };
 	}
-	if (byHash.length === 1) return { index: byHash[0], how: 'same element after a re-render' };
-	if (byId.length === 1) return { index: byId[0], how: `same #${ident.id} after a re-render` };
-	if (byXpath.length === 1) return { index: byXpath[0], how: 'same place in the page after a re-render' };
-	if (byName.length === 1) return { index: byName[0], how: `the only <${ident.tag}> named "${ident.name}" after a re-render` };
-	return null;
+	// Otherwise the element's look-alikes must all still be there (same count)
+	// and we take the one at the same ordinal — if one of them vanished (the
+	// model just removed cart row A) this is NOT a re-render and must fail.
+	const before = ordinalsOf(oldMap).get(index);
+	if (!before) return null;
+	const after = ordinalsOf(newMap);
+	const candidates = [...after.entries()].filter(([, o]) => o.key === before.key).sort((a, b) => a[1].ordinal - b[1].ordinal);
+	if (candidates.length !== before.count) return null;
+	const pick = candidates[before.ordinal];
+	if (!pick) return null;
+	return { index: pick[0], how: before.count === 1 ? 'same element after a re-render' : `same element (${before.ordinal + 1} of ${before.count} alike) after a re-render` };
 }
 
 /** Between two actions of a batch: a click that navigates has returned but the
@@ -608,11 +660,10 @@ const STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientR
 /** Is the page still fetching or showing a loading state? (Same signals the
  *  engine's readiness wait uses: unfinished resources, spinners, aria-busy.) */
 const LOADING_PROBE = `(() => {
-	// Only requests that STARTED recently and have not finished: a long-poll,
-	// an event stream or a websocket-ish request never ends and would say
-	// "still loading" forever on any page with a live feed.
-	const t = performance.now();
-	const pending = performance.getEntriesByType('resource').filter(e => e.responseEnd === 0 && t - e.startTime < 5000).length;
+	// In-flight requests are not observable from page JS (Resource Timing only
+	// records a request once it completed or failed), so the signals are the
+	// document state and a visible, animated or self-describing indicator.
+	const pending = 0;
 	// A visible indicator whose class is a whole token (spinner / skeleton /
 	// loading / is-loading), never an <img loading="lazy"> or a "loading-lazy"
 	// class that is on the page for good.

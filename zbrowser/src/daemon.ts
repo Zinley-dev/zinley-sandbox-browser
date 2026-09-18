@@ -209,7 +209,8 @@ class Daemon {
    *  session dead so the next call relaunches. */
   noteBrowserError(err: unknown): void {
     const msg = String((err as any)?.message || err || '');
-    if (/(?:browser|context|page)(?:,| or)? (?:context or browser )?has been closed|Browser closed|Target closed|browserContext\.|Connection closed/i.test(msg)) {
+    // Only the "it is gone" signatures — a non-fatal "browserContext.newPage: Timeout" must not relaunch Chromium.
+    if (/(?:browser|context|page)(?:,| or)? (?:context or browser )?has been closed|Browser closed|Target closed|Connection closed|browser has been disconnected/i.test(msg)) {
       if (!this.sessionDead) log(`browser looks dead (${msg.slice(0, 100)}); it will be relaunched on the next call`);
       this.sessionDead = true;
     }
@@ -287,6 +288,11 @@ class Daemon {
       let blocked = 0;
       await context.route('**/*', (route: any) => {
         try {
+          // Never a top-level navigation: the model may be asked to OPEN
+          // sentry.io / datadoghq.com / mixpanel.com itself, and a document
+          // request's frame URL is the PREVIOUS page, so its host is meaningless.
+          const rt = String(route.request().resourceType?.() || '');
+          if (rt === 'document') return route.continue();
           const url = new URL(route.request().url());
           const pageHost = (() => {
             try {
@@ -295,8 +301,9 @@ class Daemon {
               return '';
             }
           })();
-          const thirdParty = pageHost && !url.hostname.endsWith(pageHost.replace(/^www\./, ''));
-          if (BLOCKED_HOSTS.test(url.hostname) || (thirdParty && BLOCKED_PATHS.test(url.pathname))) {
+          const thirdParty = !!pageHost && !url.hostname.endsWith(pageHost.replace(/^www\./, ''));
+          // Only third-party subresources: a site's own /track or /collect endpoint is its own business.
+          if (thirdParty && (BLOCKED_HOSTS.test(url.hostname) || BLOCKED_PATHS.test(url.pathname))) {
             blocked++;
             return route.abort('blockedbyclient');
           }
