@@ -55477,7 +55477,15 @@ var ZB_DEPS_DIR = `${ZB_STATE_DIR}/rt`;
 var ZB_LOG_FILE = `${ZB_STATE_DIR}/zbrowser.log`;
 
 // sandbox-runtime/zbrowser/src/daemon.ts
-var VERSION2 = true ? "2026-09-17-ec970e4" : "dev";
+var VERSION2 = true ? "2026-09-18-ec970e4" : "dev";
+var BUNDLE_HASH = (() => {
+  try {
+    return String(JSON.parse(fs11.readFileSync(path10.join(__dirname, "manifest.json"), "utf8")).hash || "") || void 0;
+  } catch {
+    return void 0;
+  }
+})();
+var DOWNLOAD_MAX_AGE_MS = 7 * 24 * 36e5;
 var WORKSPACE = process.env.ZB_WORKSPACE || path10.join(os4.homedir(), "workspace");
 var PROFILE_DIR = path10.join(WORKSPACE, ZB_PROFILE_DIR);
 var DOWNLOADS_DIR = path10.join(WORKSPACE, ZB_DOWNLOADS_DIR);
@@ -55500,6 +55508,11 @@ var Daemon = class {
   constructor() {
     this.session = null;
     this.starting = null;
+    /** Set when a browser error says the browser/context is gone: the next
+     *  ensureBrowser relaunches instead of handing out a dead session. */
+    this.sessionDead = false;
+    /** One note for the first state after a crash relaunch. */
+    this.restartNote = null;
     this.task = null;
     this.llm = null;
     this.token = "";
@@ -55564,13 +55577,50 @@ var Daemon = class {
     }
     return void 0;
   }
+  /** Chromium died (OOM, crash, killed): the session object outlives it and
+   *  every call fails with "browser has been closed" until the box sleeps. */
+  sessionAlive(session) {
+    if (this.sessionDead) return false;
+    const b2 = session.browser;
+    if (b2 && typeof b2.isConnected === "function" && !b2.isConnected()) return false;
+    return true;
+  }
+  /** Called with any browser error: a closed-browser signature marks the
+   *  session dead so the next call relaunches. */
+  noteBrowserError(err) {
+    const msg = String(err?.message || err || "");
+    if (/(?:browser|context|page)(?:,| or)? (?:context or browser )?has been closed|Browser closed|Target closed|browserContext\.|Connection closed/i.test(msg)) {
+      if (!this.sessionDead) log(`browser looks dead (${msg.slice(0, 100)}); it will be relaunched on the next call`);
+      this.sessionDead = true;
+    }
+  }
+  pruneDownloads() {
+    try {
+      const cutoff = Date.now() - DOWNLOAD_MAX_AGE_MS;
+      for (const f2 of fs11.readdirSync(DOWNLOADS_DIR)) {
+        const fp = path10.join(DOWNLOADS_DIR, f2);
+        try {
+          if (fs11.statSync(fp).mtimeMs < cutoff) fs11.rmSync(fp, { recursive: true, force: true });
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
   async ensureBrowser() {
-    if (this.session) return this.session;
+    if (this.session && this.sessionAlive(this.session)) return this.session;
     if (this.starting) return this.starting;
     this.starting = (async () => {
+      if (this.session) {
+        log("relaunching chromium: the previous browser is gone");
+        await this.closeBrowser();
+        this.restartNote = 'The browser had died and was restarted (profile and logins kept) \u2014 the page you were on is gone: open it again with op="open".';
+      }
+      this.sessionDead = false;
       fs11.mkdirSync(PROFILE_DIR, { recursive: true });
       fs11.mkdirSync(DOWNLOADS_DIR, { recursive: true });
       fs11.mkdirSync(SHOTS_DIR, { recursive: true });
+      this.pruneDownloads();
       process.env.DISPLAY = DISPLAY;
       const executablePath = this.resolveExecutable();
       log(`launching chromium display=${DISPLAY} exe=${executablePath || "(channel default)"} profile=${PROFILE_DIR}`);
@@ -55587,7 +55637,10 @@ var Daemon = class {
           "--window-position=0,0",
           "--disable-session-crashed-bubble",
           "--hide-crash-restore-bubble",
-          "--password-store=basic"
+          "--password-store=basic",
+          // The profile is persistent: bound its cache so a box with a small
+          // disk does not fill up over weeks of errands.
+          "--disk-cache-size=104857600"
         ]
       });
       await session.start();
@@ -55603,7 +55656,8 @@ var Daemon = class {
   async closeBrowser() {
     const s2 = this.session;
     this.session = null;
-    if (s2) await s2.stop().catch((err) => log(`browser stop failed: ${err?.message}`));
+    this.sessionDead = false;
+    if (s2) await Promise.race([s2.stop(), new Promise((r2) => setTimeout(r2, 8e3))]).catch((err) => log(`browser stop failed: ${err?.message}`));
   }
   async currentPage(session) {
     return session.getPageOrCurrent();
@@ -55636,7 +55690,18 @@ var Daemon = class {
   /** The page as the agent's model would see it (see engine step-state.ts):
    *  tabs, viewport position, hints, `*[`-marked elements, numbered screenshot. */
   async browserState(session, includeScreenshot, inlineScreenshot = false) {
-    const st2 = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+    let st2;
+    try {
+      st2 = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+    } catch (err) {
+      this.noteBrowserError(err);
+      throw err;
+    }
+    if (this.restartNote) {
+      st2.notes = [this.restartNote, ...st2.notes ?? []];
+      this.restartNote = null;
+    }
+    for (const n2 of st2.notes ?? []) this.noteBrowserError(n2);
     let screenshotPath;
     let screenshot2 = null;
     if (st2.screenshot) {
@@ -55713,6 +55778,7 @@ var Daemon = class {
       pageExtractionLlm: this.token ? this.ensureLlm() : void 0
     };
     const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
+    for (const r2 of run.results) if (r2.error) this.noteBrowserError(r2.error);
     let state;
     let stateError;
     try {
@@ -55872,6 +55938,7 @@ var Daemon = class {
     return {
       ok: true,
       version: VERSION2,
+      hash: BUNDLE_HASH,
       pid: process.pid,
       uptimeS: Math.round((Date.now() - this.startedAt) / 1e3),
       browserOpen: !!this.session,

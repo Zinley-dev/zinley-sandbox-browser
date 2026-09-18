@@ -52,6 +52,18 @@ import {
 
 declare const __ZB_VERSION__: string;
 const VERSION = typeof __ZB_VERSION__ === 'string' ? __ZB_VERSION__ : 'dev';
+/** The bundle's manifest hash, read from the directory this file runs from:
+ *  the backend compares it with the runtime it just cloned. VERSION alone is
+ *  the build date + engine commit and stayed the same across three runtime
+ *  tags, so an old daemon kept serving after a re-clone. */
+const BUNDLE_HASH: string | undefined = (() => {
+  try {
+    return String(JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8')).hash || '') || undefined;
+  } catch {
+    return undefined;
+  }
+})();
+const DOWNLOAD_MAX_AGE_MS = 7 * 24 * 3600_000;
 
 // ─── config (env, set by the backend when it launches the daemon) ───────────
 const WORKSPACE = process.env.ZB_WORKSPACE || path.join(os.homedir(), 'workspace');
@@ -87,6 +99,11 @@ interface TaskState extends ZbTaskSnapshot {
 class Daemon {
   private session: BrowserSession | null = null;
   private starting: Promise<BrowserSession> | null = null;
+  /** Set when a browser error says the browser/context is gone: the next
+   *  ensureBrowser relaunches instead of handing out a dead session. */
+  private sessionDead = false;
+  /** One note for the first state after a crash relaunch. */
+  private restartNote: string | null = null;
   private registry: ActionRegistry;
   private task: TaskState | null = null;
   private llm: ChatSnowX | null = null;
@@ -167,13 +184,55 @@ class Daemon {
     return undefined;
   }
 
+  /** Chromium died (OOM, crash, killed): the session object outlives it and
+   *  every call fails with "browser has been closed" until the box sleeps. */
+  private sessionAlive(session: BrowserSession): boolean {
+    if (this.sessionDead) return false;
+    const b: any = (session as any).browser;
+    if (b && typeof b.isConnected === 'function' && !b.isConnected()) return false;
+    return true;
+  }
+
+  /** Called with any browser error: a closed-browser signature marks the
+   *  session dead so the next call relaunches. */
+  noteBrowserError(err: unknown): void {
+    const msg = String((err as any)?.message || err || '');
+    if (/(?:browser|context|page)(?:,| or)? (?:context or browser )?has been closed|Browser closed|Target closed|browserContext\.|Connection closed/i.test(msg)) {
+      if (!this.sessionDead) log(`browser looks dead (${msg.slice(0, 100)}); it will be relaunched on the next call`);
+      this.sessionDead = true;
+    }
+  }
+
+  private pruneDownloads(): void {
+    try {
+      const cutoff = Date.now() - DOWNLOAD_MAX_AGE_MS;
+      for (const f of fs.readdirSync(DOWNLOADS_DIR)) {
+        const fp = path.join(DOWNLOADS_DIR, f);
+        try {
+          if (fs.statSync(fp).mtimeMs < cutoff) fs.rmSync(fp, { recursive: true, force: true });
+        } catch {
+          /* best effort */
+        }
+      }
+    } catch {
+      /* best effort */
+    }
+  }
+
   async ensureBrowser(): Promise<BrowserSession> {
-    if (this.session) return this.session;
+    if (this.session && this.sessionAlive(this.session)) return this.session;
     if (this.starting) return this.starting;
     this.starting = (async () => {
+      if (this.session) {
+        log('relaunching chromium: the previous browser is gone');
+        await this.closeBrowser();
+        this.restartNote = 'The browser had died and was restarted (profile and logins kept) — the page you were on is gone: open it again with op="open".';
+      }
+      this.sessionDead = false;
       fs.mkdirSync(PROFILE_DIR, { recursive: true });
       fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
       fs.mkdirSync(SHOTS_DIR, { recursive: true });
+      this.pruneDownloads();
       process.env.DISPLAY = DISPLAY;
       const executablePath = this.resolveExecutable();
       log(`launching chromium display=${DISPLAY} exe=${executablePath || '(channel default)'} profile=${PROFILE_DIR}`);
@@ -191,6 +250,9 @@ class Daemon {
           '--disable-session-crashed-bubble',
           '--hide-crash-restore-bubble',
           '--password-store=basic',
+          // The profile is persistent: bound its cache so a box with a small
+          // disk does not fill up over weeks of errands.
+          '--disk-cache-size=104857600',
         ],
       });
       await session.start();
@@ -207,7 +269,8 @@ class Daemon {
   async closeBrowser(): Promise<void> {
     const s = this.session;
     this.session = null;
-    if (s) await s.stop().catch(err => log(`browser stop failed: ${err?.message}`));
+    this.sessionDead = false;
+    if (s) await Promise.race([s.stop(), new Promise(r => setTimeout(r, 8000))]).catch(err => log(`browser stop failed: ${err?.message}`));
   }
 
   private async currentPage(session: BrowserSession) {
@@ -245,7 +308,18 @@ class Daemon {
   /** The page as the agent's model would see it (see engine step-state.ts):
    *  tabs, viewport position, hints, `*[`-marked elements, numbered screenshot. */
   async browserState(session: BrowserSession, includeScreenshot: boolean, inlineScreenshot = false): Promise<ZbBrowserState> {
-    const st = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+    let st;
+    try {
+      st = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+    } catch (err) {
+      this.noteBrowserError(err);
+      throw err;
+    }
+    if (this.restartNote) {
+      st.notes = [this.restartNote, ...(st.notes ?? [])];
+      this.restartNote = null;
+    }
+    for (const n of st.notes ?? []) this.noteBrowserError(n);
     let screenshotPath: string | undefined;
     let screenshot: string | null = null;
     if (st.screenshot) {
@@ -327,6 +401,7 @@ class Daemon {
       pageExtractionLlm: this.token ? this.ensureLlm() : undefined,
     } as ActionContext;
     const run = await runStepActions(session, this.registry, actions, context, { actionTimeoutS: 60, max: 5 });
+    for (const r of run.results) if (r.error) this.noteBrowserError(r.error);
     // What ran must reach the model even when the page cannot be read afterwards
     // (the site closed the tab, Chrome died): the results are the record of a
     // submit that DID happen.
@@ -509,6 +584,7 @@ class Daemon {
     return {
       ok: true,
       version: VERSION,
+      hash: BUNDLE_HASH,
       pid: process.pid,
       uptimeS: Math.round((Date.now() - this.startedAt) / 1000),
       browserOpen: !!this.session,

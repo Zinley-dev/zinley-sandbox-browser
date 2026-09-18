@@ -72,6 +72,8 @@ export interface ZbTaskSnapshot {
 export interface ZbHealth {
   ok: true;
   version: string;
+  /** Bundle manifest hash of the running daemon (runtime ≥ v1.0.5). */
+  hash?: string;
   pid: number;
   uptimeS: number;
   browserOpen: boolean;
