@@ -415,6 +415,11 @@ const INTERACTIVE_ROLES = new Set([
  * DOM extraction service for getting page state
  * Supports both basic JS extraction and CDP-based extraction
  */
+/** Longest text shown for one element (upstream cap_text_length is 100). */
+const ELEMENT_TEXT_MAX_CHARS = 140;
+/** Subtrees whose text is never page content. */
+const TEXT_SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'HEAD', 'TITLE', 'META', 'LINK', 'IFRAME']);
+
 export class DOMService {
 	/** Above this many elements with click listeners, listener resolution is skipped */
 	static readonly MAX_JS_CLICK_LISTENER_ELEMENTS = 100;
@@ -2139,26 +2144,37 @@ export class DOMService {
 				// Fallback: Extract text from ALL descendant TEXT_NODEs recursively (like Python get_all_children_text)
 				// Python's get_all_children_text is RECURSIVE - collects from entire subtree
 				if (!text && node.children) {
+					// Upstream caps an element's text and never reads script-like
+					// subtrees. Without the cap a page root that carries a delegated
+					// click listener (React's #root / #__next) dumped the WHOLE page's
+					// text — hidden menus, <noscript> iframe markup, JSON-LD — as 170
+					// lines under one index, burying every real control below the
+					// character budget.
+					let budget = ELEMENT_TEXT_MAX_CHARS * 2;
 					const collectTextRecursive = (n: CDPDOMNode): string[] => {
 						const parts: string[] = [];
+						if (budget <= 0) return parts;
+						if (n.nodeType === 1 && TEXT_SKIP_TAGS.has(String(n.nodeName || '').toUpperCase())) return parts;
 						// nodeType 3 = TEXT_NODE
 						// Python requires len > 1 (minimum 2 chars) to filter single-char noise
 						if (n.nodeType === 3 && n.nodeValue) {
 							const trimmed = n.nodeValue.trim();
 							if (trimmed.length > 1) {
 								parts.push(trimmed);
+								budget -= trimmed.length;
 							}
 						}
 						// Recurse into children
 						if (n.children) {
 							for (const child of n.children) {
+								if (budget <= 0) break;
 								parts.push(...collectTextRecursive(child));
 							}
 						}
 						return parts;
 					};
 					const textParts = collectTextRecursive(node);
-					text = textParts.join('\n').trim();
+					text = textParts.join(' ').replace(/\s+/g, ' ').trim();
 				}
 
 				// Fallback: Use nodeValue for text content (for text nodes themselves)
@@ -2596,9 +2612,13 @@ export class DOMService {
 
 				output += '\n';
 
-				// Python: Text nodes are shown on separate lines (lines 920-930)
+				// Python: Text nodes are shown on separate lines (lines 920-930),
+				// capped like upstream's cap_text_length so one element never
+				// costs more than a line or two.
 				if (node.text && node.text.trim().length > 1) {
-					output += `${prefix}\t${node.text.trim()}\n`;
+					let t = node.text.replace(/\s+/g, ' ').trim();
+					if (t.length > ELEMENT_TEXT_MAX_CHARS) t = `${t.slice(0, ELEMENT_TEXT_MAX_CHARS)}…`;
+					output += `${prefix}\t${t}\n`;
 				}
 
 				// Iframes: hint at content hidden below the iframe viewport (port of the upstream scroll hints)

@@ -33,7 +33,7 @@ import { ActionRegistry, type ActionContext } from '../../browser-use-engine/act
 import { registerBuiltinActions } from '../../browser-use-engine/actions/builtin.js';
 import { ChatSnowX } from '../../browser-use-engine/llm/snowx/chat.js';
 import type { ActionResult } from '../../browser-use-engine/types/agent.js';
-import { captureStepState, runStepActions, type StepAction } from '../../browser-use-engine/step-state.js';
+import { captureStepState, runStepActions, settleAfterActions, type StepAction } from '../../browser-use-engine/step-state.js';
 
 import {
   ZB_DAEMON_PORT,
@@ -74,7 +74,10 @@ const PORT = Number(process.env.ZB_PORT || ZB_DAEMON_PORT);
 const DISPLAY = process.env.DISPLAY || ':1';
 const WINDOW_W = Number(process.env.ZB_WINDOW_W || 1280);
 const WINDOW_H = Number(process.env.ZB_WINDOW_H || 800);
-const MAX_ELEMENTS_CHARS = Number(process.env.ZB_MAX_ELEMENTS_CHARS || 12000);
+const MAX_ELEMENTS_CHARS = Number(process.env.ZB_MAX_ELEMENTS_CHARS || 16000);
+/** JPEG quality of the step frame: the model reads ~1.4k tokens whatever the
+ *  byte size, so lower is pure transfer savings until text gets mushy. */
+const SHOT_QUALITY = Number(process.env.ZB_SHOT_QUALITY || 45);
 const IDLE_EXIT_MS = Number(process.env.ZB_IDLE_EXIT_MS || 0); // 0 = never self-exit
 /** File actions are disabled: the mutation lease on the backend assumes the
  *  browser only writes its own profile/downloads, never workspace files. */
@@ -283,7 +286,7 @@ class Daemon {
   async screenshotJpeg(session: BrowserSession, quality = 60, inline = false): Promise<{ path?: string; base64?: string } | null> {
     try {
       const page: any = await this.currentPage(session);
-      const buf: Buffer = await page.screenshot({ type: 'jpeg', quality, timeout: 15000 });
+      const buf: Buffer = await page.screenshot({ type: 'jpeg', quality, scale: 'css', timeout: 15000 });
       if (inline) return { base64: buf.toString('base64') };
       fs.mkdirSync(SHOTS_DIR, { recursive: true });
       try {
@@ -307,10 +310,10 @@ class Daemon {
 
   /** The page as the agent's model would see it (see engine step-state.ts):
    *  tabs, viewport position, hints, `*[`-marked elements, numbered screenshot. */
-  async browserState(session: BrowserSession, includeScreenshot: boolean, inlineScreenshot = false): Promise<ZbBrowserState> {
+  async browserState(session: BrowserSession, includeScreenshot: boolean, inlineScreenshot = false, inlineMax = 0): Promise<ZbBrowserState> {
     let st;
     try {
-      st = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+      st = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: SHOT_QUALITY, maxElementsChars: MAX_ELEMENTS_CHARS });
     } catch (err) {
       this.noteBrowserError(err);
       throw err;
@@ -323,7 +326,9 @@ class Daemon {
     let screenshotPath: string | undefined;
     let screenshot: string | null = null;
     if (st.screenshot) {
-      if (inlineScreenshot) screenshot = st.screenshot;
+      // Inline when the caller can take it in the response (saves the backend a
+      // file download per step); a frame above the caller's cap goes to disk.
+      if (inlineScreenshot || (inlineMax > 0 && st.screenshot.length <= inlineMax)) screenshot = st.screenshot;
       else screenshotPath = this.writeShot(Buffer.from(st.screenshot, 'base64'));
     }
     return {
@@ -335,6 +340,7 @@ class Daemon {
       interactiveCount: st.interactiveCount,
       pageInfo: st.pageInfo,
       notes: st.notes,
+      delta: st.delta,
       screenshot,
       screenshotPath,
       screenshotMime: st.screenshot ? 'image/jpeg' : undefined,
@@ -383,7 +389,7 @@ class Daemon {
   }
 
   // ── single actions / short batches ──
-  async act(action: string, params: Record<string, unknown>, inlineScreenshot = false, batch?: StepAction[]): Promise<ZbActResult> {
+  async act(action: string, params: Record<string, unknown>, inlineScreenshot = false, batch?: StepAction[], inlineMax = 0): Promise<ZbActResult> {
     const session = await this.ensureBrowser();
     const actions: StepAction[] = batch && batch.length > 0 ? batch : [{ action, params }];
     const label = actions.map(a => a.action).join(' → ');
@@ -408,7 +414,7 @@ class Daemon {
     let state: ZbBrowserState | undefined;
     let stateError: string | undefined;
     try {
-      state = await this.browserState(session, true, inlineScreenshot);
+      state = await this.browserState(session, true, inlineScreenshot, inlineMax);
     } catch (err: any) {
       stateError = `The page could not be read after the action(s) (${String(err?.message || err).slice(0, 120)}) — op="state" to look again.`;
       log(`act: state capture failed: ${err?.message}`);
@@ -621,8 +627,10 @@ class Daemon {
             } catch (err: any) {
               navError = `Opening ${body.url} did not complete (${String(err?.message || err).slice(0, 100)}) — the page below is what the browser shows now.`;
             }
+            // Single-page apps keep rendering after "load": read the page once it is still.
+            await settleAfterActions(session);
           }
-          const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true, Number(body?.inlineMax) || 0);
           if (navError) state.notes = [navError, ...(state.notes ?? [])];
           // The engine's own action reference — the exact parameters the agent's
           // model gets — minus the agent-loop-only actions. No URL: with one the
@@ -635,7 +643,7 @@ class Daemon {
           return state;
         });
       case 'browser/state':
-        return this.serialized(async () => this.browserState(await this.ensureBrowser(), body?.screenshot !== false, body?.inline === true));
+        return this.serialized(async () => this.browserState(await this.ensureBrowser(), body?.screenshot !== false, body?.inline === true, Number(body?.inlineMax) || 0));
       case 'browser/screenshot':
         return this.serialized(async () => {
           const session = await this.ensureBrowser();
@@ -654,7 +662,7 @@ class Daemon {
         // token with the step that needs it (a task start is the other source).
         if (typeof body?.token === 'string' && body.token) this.setToken(body.token, body.model, body.proxyBase);
         return this.serialized(() =>
-          this.act(String(body?.action || batch![0].action), body?.params && typeof body.params === 'object' ? body.params : {}, body?.inline === true, batch),
+          this.act(String(body?.action || batch![0].action), body?.params && typeof body.params === 'object' ? body.params : {}, body?.inline === true, batch, Number(body?.inlineMax) || 0),
         );
       }
       case 'browser/close':

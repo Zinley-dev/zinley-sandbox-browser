@@ -100,6 +100,8 @@ export interface ZbBrowserState {
   actionsHelp?: string;
   /** Inline base64 only when requested (`inline:true`); normally the daemon
    *  writes the JPEG under the workspace and returns `screenshotPath`. */
+  /** What changed since the previous capture (runtime ≥ v1.0.7). */
+  delta?: string;
   screenshot?: string | null;
   screenshotPath?: string;
   screenshotMime?: string;

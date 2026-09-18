@@ -40,6 +40,8 @@ export interface StepState {
 	pageInfo: string;
 	/** Hints the agent's model gets too: auto-closed dialogs, PDF viewer, capture errors. */
 	notes: string[];
+	/** What changed since the previous capture on this session: navigation, a new tab, or nothing. */
+	delta?: string;
 	/** JPEG base64 with numbered boxes over the interactive elements. */
 	screenshot?: string | null;
 	screenshotMime?: string;
@@ -83,6 +85,12 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		selectorMap = state.domState?.selectorMap;
 		out.interactiveCount = selectorMap?.size ?? 0;
 		let elements: string = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? '', selectorMap);
+		if (lastDelta) out.delta = lastDelta;
+		// Almost nothing on a real URL: still rendering, or a bot wall. Say so
+		// instead of letting the model conclude the site has no such button.
+		if (out.interactiveCount <= 3 && elements.replace(/\s+/g, ' ').length < 200 && /^https?:/i.test(out.url)) {
+			out.notes.push('Almost no content on this page — it may still be rendering or be a bot wall: wait{seconds:3} then op="state"; if it stays empty, try another route or tell the user.');
+		}
 		const pi = state.pageInfo;
 		let above = false;
 		let below = false;
@@ -156,6 +164,8 @@ async function getStateWithPage(session: BrowserSession): Promise<any> {
 }
 
 const lastSeen = new WeakMap<object, { url: string; ids: Set<number> }>();
+/** Set by markNewElements for the capture in progress (one capture at a time per session). */
+let lastDelta: string | undefined;
 const INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
 
 /** Star an element only when the previous capture of the SAME url did not
@@ -171,6 +181,15 @@ function markNewElements(session: BrowserSession, url: string, elements: string,
 	const prev = lastSeen.get(session as object);
 	lastSeen.set(session as object, { url, ids });
 	const samePage = !!prev && prev.url === url && prev.ids.size > 0;
+	lastDelta = !prev
+		? undefined
+		: prev.url !== url
+			? `Navigated: ${prev.url || '(blank)'} → ${url}`
+			: (() => {
+					let fresh = 0;
+					for (const id of ids) if (!prev.ids.has(id)) fresh++;
+					return fresh > 0 ? `Same page, ${fresh} new element(s) (marked *[)` : 'Same page, nothing new';
+				})();
 	return elements.replace(INDEX_LINE, (_m, indent: string, idx: string) => {
 		const id = Number(selectorMap?.get(Number(idx))?.backendNodeId);
 		const isNew = samePage && Number.isFinite(id) && !prev!.ids.has(id);
@@ -367,7 +386,31 @@ export async function settleAfterActions(session: BrowserSession): Promise<void>
 		const idle = (session as any).waitForNetworkIdle;
 		// The engine's helper counts in SECONDS.
 		if (typeof idle === 'function') await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => undefined);
-		await new Promise(resolve => setTimeout(resolve, 150));
+		await waitUntilStable(page);
+	} catch {
+		/* best effort */
+	}
+}
+
+const STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n + ':' + document.body?.innerText?.length; })()`;
+
+/**
+ * Single-page apps keep rendering after "load" and network idle (DoorDash:
+ * 25 controls the moment navigate returns, 38 three seconds later). Sample
+ * the visible controls until two consecutive readings agree, bounded.
+ */
+export async function waitUntilStable(page: any, opts: { maxMs?: number; intervalMs?: number } = {}): Promise<void> {
+	const maxMs = opts.maxMs ?? 4000;
+	const intervalMs = opts.intervalMs ?? 300;
+	const started = Date.now();
+	let last = '';
+	try {
+		while (Date.now() - started < maxMs) {
+			const cur = String(await page.evaluate(STABLE_PROBE).catch(() => ''));
+			if (cur && cur === last && cur.startsWith('complete')) return;
+			last = cur;
+			await new Promise(resolve => setTimeout(resolve, intervalMs));
+		}
 	} catch {
 		/* best effort */
 	}

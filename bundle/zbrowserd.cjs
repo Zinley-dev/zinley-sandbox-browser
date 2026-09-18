@@ -34112,6 +34112,8 @@ var INTERACTIVE_SELECTORS = [
   "details",
   "label[for]"
 ].join(", ");
+var ELEMENT_TEXT_MAX_CHARS = 140;
+var TEXT_SKIP_TAGS = /* @__PURE__ */ new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "HEAD", "TITLE", "META", "LINK", "IFRAME"]);
 var DOMService = class _DOMService {
   constructor(page, options = {}) {
     this.page = page;
@@ -35378,23 +35380,28 @@ var DOMService = class _DOMService {
           role = axNode.role || role;
         }
         if (!text && node.children) {
+          let budget = ELEMENT_TEXT_MAX_CHARS * 2;
           const collectTextRecursive = (n2) => {
             const parts = [];
+            if (budget <= 0) return parts;
+            if (n2.nodeType === 1 && TEXT_SKIP_TAGS.has(String(n2.nodeName || "").toUpperCase())) return parts;
             if (n2.nodeType === 3 && n2.nodeValue) {
               const trimmed = n2.nodeValue.trim();
               if (trimmed.length > 1) {
                 parts.push(trimmed);
+                budget -= trimmed.length;
               }
             }
             if (n2.children) {
               for (const child of n2.children) {
+                if (budget <= 0) break;
                 parts.push(...collectTextRecursive(child));
               }
             }
             return parts;
           };
           const textParts = collectTextRecursive(node);
-          text = textParts.join("\n").trim();
+          text = textParts.join(" ").replace(/\s+/g, " ").trim();
         }
         if (!text && node.nodeValue) {
           text = node.nodeValue.trim().substring(0, 200);
@@ -35707,7 +35714,9 @@ var DOMService = class _DOMService {
         }
         output += "\n";
         if (node.text && node.text.trim().length > 1) {
-          output += `${prefix}	${node.text.trim()}
+          let t2 = node.text.replace(/\s+/g, " ").trim();
+          if (t2.length > ELEMENT_TEXT_MAX_CHARS) t2 = `${t2.slice(0, ELEMENT_TEXT_MAX_CHARS)}\u2026`;
+          output += `${prefix}	${t2}
 `;
         }
         if (node.hiddenElementsInfo && node.hiddenElementsInfo.length > 0) {
@@ -55264,6 +55273,10 @@ async function captureStepState(session, opts = {}) {
     selectorMap = state.domState?.selectorMap;
     out.interactiveCount = selectorMap?.size ?? 0;
     let elements = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "", selectorMap);
+    if (lastDelta) out.delta = lastDelta;
+    if (out.interactiveCount <= 3 && elements.replace(/\s+/g, " ").length < 200 && /^https?:/i.test(out.url)) {
+      out.notes.push('Almost no content on this page \u2014 it may still be rendering or be a bot wall: wait{seconds:3} then op="state"; if it stays empty, try another route or tell the user.');
+    }
     const pi = state.pageInfo;
     let above = false;
     let below = false;
@@ -55332,6 +55345,7 @@ async function getStateWithPage(session) {
   }
 }
 var lastSeen = /* @__PURE__ */ new WeakMap();
+var lastDelta;
 var INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
 function markNewElements(session, url, elements, selectorMap) {
   const ids = /* @__PURE__ */ new Set();
@@ -55344,6 +55358,11 @@ function markNewElements(session, url, elements, selectorMap) {
   const prev = lastSeen.get(session);
   lastSeen.set(session, { url, ids });
   const samePage = !!prev && prev.url === url && prev.ids.size > 0;
+  lastDelta = !prev ? void 0 : prev.url !== url ? `Navigated: ${prev.url || "(blank)"} \u2192 ${url}` : (() => {
+    let fresh = 0;
+    for (const id of ids) if (!prev.ids.has(id)) fresh++;
+    return fresh > 0 ? `Same page, ${fresh} new element(s) (marked *[)` : "Same page, nothing new";
+  })();
   return elements.replace(INDEX_LINE, (_m, indent, idx) => {
     const id = Number(selectorMap?.get(Number(idx))?.backendNodeId);
     const isNew = samePage && Number.isFinite(id) && !prev.ids.has(id);
@@ -55460,7 +55479,23 @@ async function settleAfterActions(session) {
     await page.waitForLoadState("domcontentloaded", { timeout: 2e3 }).catch(() => void 0);
     const idle = session.waitForNetworkIdle;
     if (typeof idle === "function") await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => void 0);
-    await new Promise((resolve2) => setTimeout(resolve2, 150));
+    await waitUntilStable(page);
+  } catch {
+  }
+}
+var STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n + ':' + document.body?.innerText?.length; })()`;
+async function waitUntilStable(page, opts = {}) {
+  const maxMs = opts.maxMs ?? 4e3;
+  const intervalMs = opts.intervalMs ?? 300;
+  const started = Date.now();
+  let last = "";
+  try {
+    while (Date.now() - started < maxMs) {
+      const cur = String(await page.evaluate(STABLE_PROBE).catch(() => ""));
+      if (cur && cur === last && cur.startsWith("complete")) return;
+      last = cur;
+      await new Promise((resolve2) => setTimeout(resolve2, intervalMs));
+    }
   } catch {
   }
 }
@@ -55497,7 +55532,8 @@ var PORT = Number(process.env.ZB_PORT || ZB_DAEMON_PORT);
 var DISPLAY = process.env.DISPLAY || ":1";
 var WINDOW_W = Number(process.env.ZB_WINDOW_W || 1280);
 var WINDOW_H = Number(process.env.ZB_WINDOW_H || 800);
-var MAX_ELEMENTS_CHARS = Number(process.env.ZB_MAX_ELEMENTS_CHARS || 12e3);
+var MAX_ELEMENTS_CHARS = Number(process.env.ZB_MAX_ELEMENTS_CHARS || 16e3);
+var SHOT_QUALITY = Number(process.env.ZB_SHOT_QUALITY || 45);
 var IDLE_EXIT_MS = Number(process.env.ZB_IDLE_EXIT_MS || 0);
 var DISABLED_ACTIONS = ["write_file", "read_file", "replace_file"];
 process.env.ANONYMIZED_TELEMETRY = "false";
@@ -55671,7 +55707,7 @@ var Daemon = class {
   async screenshotJpeg(session, quality = 60, inline = false) {
     try {
       const page = await this.currentPage(session);
-      const buf = await page.screenshot({ type: "jpeg", quality, timeout: 15e3 });
+      const buf = await page.screenshot({ type: "jpeg", quality, scale: "css", timeout: 15e3 });
       if (inline) return { base64: buf.toString("base64") };
       fs11.mkdirSync(SHOTS_DIR, { recursive: true });
       try {
@@ -55692,10 +55728,10 @@ var Daemon = class {
   }
   /** The page as the agent's model would see it (see engine step-state.ts):
    *  tabs, viewport position, hints, `*[`-marked elements, numbered screenshot. */
-  async browserState(session, includeScreenshot, inlineScreenshot = false) {
+  async browserState(session, includeScreenshot, inlineScreenshot = false, inlineMax = 0) {
     let st2;
     try {
-      st2 = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: 60, maxElementsChars: MAX_ELEMENTS_CHARS });
+      st2 = await captureStepState(session, { screenshot: includeScreenshot, jpegQuality: SHOT_QUALITY, maxElementsChars: MAX_ELEMENTS_CHARS });
     } catch (err) {
       this.noteBrowserError(err);
       throw err;
@@ -55708,7 +55744,7 @@ var Daemon = class {
     let screenshotPath;
     let screenshot2 = null;
     if (st2.screenshot) {
-      if (inlineScreenshot) screenshot2 = st2.screenshot;
+      if (inlineScreenshot || inlineMax > 0 && st2.screenshot.length <= inlineMax) screenshot2 = st2.screenshot;
       else screenshotPath = this.writeShot(Buffer.from(st2.screenshot, "base64"));
     }
     return {
@@ -55720,6 +55756,7 @@ var Daemon = class {
       interactiveCount: st2.interactiveCount,
       pageInfo: st2.pageInfo,
       notes: st2.notes,
+      delta: st2.delta,
       screenshot: screenshot2,
       screenshotPath,
       screenshotMime: st2.screenshot ? "image/jpeg" : void 0,
@@ -55763,7 +55800,7 @@ var Daemon = class {
     }
   }
   // ── single actions / short batches ──
-  async act(action, params, inlineScreenshot = false, batch) {
+  async act(action, params, inlineScreenshot = false, batch, inlineMax = 0) {
     const session = await this.ensureBrowser();
     const actions = batch && batch.length > 0 ? batch : [{ action, params }];
     const label = actions.map((a2) => a2.action).join(" \u2192 ");
@@ -55785,7 +55822,7 @@ var Daemon = class {
     let state;
     let stateError;
     try {
-      state = await this.browserState(session, true, inlineScreenshot);
+      state = await this.browserState(session, true, inlineScreenshot, inlineMax);
     } catch (err) {
       stateError = `The page could not be read after the action(s) (${String(err?.message || err).slice(0, 120)}) \u2014 op="state" to look again.`;
       log(`act: state capture failed: ${err?.message}`);
@@ -55974,14 +56011,15 @@ var Daemon = class {
             } catch (err) {
               navError = `Opening ${body.url} did not complete (${String(err?.message || err).slice(0, 100)}) \u2014 the page below is what the browser shows now.`;
             }
+            await settleAfterActions(session);
           }
-          const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true);
+          const state = await this.browserState(session, body?.screenshot !== false, body?.inline === true, Number(body?.inlineMax) || 0);
           if (navError) state.notes = [navError, ...state.notes ?? []];
           state.actionsHelp = this.registry.getPromptDescription().split("\n").filter((line) => !/^(?:done|request_user_help|write_file|read_file|replace_file|screenshot|save_as_pdf):/.test(line)).join("\n");
           return state;
         });
       case "browser/state":
-        return this.serialized(async () => this.browserState(await this.ensureBrowser(), body?.screenshot !== false, body?.inline === true));
+        return this.serialized(async () => this.browserState(await this.ensureBrowser(), body?.screenshot !== false, body?.inline === true, Number(body?.inlineMax) || 0));
       case "browser/screenshot":
         return this.serialized(async () => {
           const session = await this.ensureBrowser();
@@ -55994,7 +56032,7 @@ var Daemon = class {
         if ((!batch || batch.length === 0) && (!body?.action || typeof body.action !== "string")) throw new Error("action (or actions[]) is required");
         if (typeof body?.token === "string" && body.token) this.setToken(body.token, body.model, body.proxyBase);
         return this.serialized(
-          () => this.act(String(body?.action || batch[0].action), body?.params && typeof body.params === "object" ? body.params : {}, body?.inline === true, batch)
+          () => this.act(String(body?.action || batch[0].action), body?.params && typeof body.params === "object" ? body.params : {}, body?.inline === true, batch, Number(body?.inlineMax) || 0)
         );
       }
       case "browser/close":
