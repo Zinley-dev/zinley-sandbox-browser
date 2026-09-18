@@ -2575,8 +2575,8 @@ export class DOMService {
 					}
 
 					// Python: Remove attrs that duplicate text (lines 1009-1012)
-					const text = node.text?.trim().toLowerCase() || '';
-					for (const attr of ['aria-label', 'placeholder', 'title']) {
+					const text = node.text?.replace(/\s+/g, ' ').trim().toLowerCase() || '';
+					for (const attr of ['aria-label', 'placeholder', 'title', 'ax_name']) {
 						if (attributesToInclude[attr]?.trim().toLowerCase() === text) {
 							delete attributesToInclude[attr];
 						}
@@ -2599,27 +2599,20 @@ export class DOMService {
 					}
 				}
 
-				// Python uses self-closing tags: /> (line 891)
-				output += `${prefix}${index}${tag}${attrs} />`;
-
+				// Upstream's serializer inlines the element's text into its own line
+				// (`[12]<a>Log in</a>`): one line per control instead of two, and the
+				// screenshot label and the text sit together. Text is capped like
+				// upstream's cap_text_length so one element never costs a paragraph.
+				let t = node.text ? node.text.replace(/\s+/g, ' ').trim() : '';
+				if (t.length > ELEMENT_TEXT_MAX_CHARS) t = `${t.slice(0, ELEMENT_TEXT_MAX_CHARS)}…`;
+				let options = '';
 				// For select elements, extract and show options (like Python)
 				if (node.tagName.toLowerCase() === 'select' && node.children.length > 0) {
-					const options = this.extractSelectOptions(node.children);
-					if (options.length > 0) {
-						output += ` [options: ${options.join(', ')}]`;
-					}
+					const opts = this.extractSelectOptions(node.children);
+					if (opts.length > 0) options = ` [options: ${opts.join(', ')}]`;
 				}
-
-				output += '\n';
-
-				// Python: Text nodes are shown on separate lines (lines 920-930),
-				// capped like upstream's cap_text_length so one element never
-				// costs more than a line or two.
-				if (node.text && node.text.trim().length > 1) {
-					let t = node.text.replace(/\s+/g, ' ').trim();
-					if (t.length > ELEMENT_TEXT_MAX_CHARS) t = `${t.slice(0, ELEMENT_TEXT_MAX_CHARS)}…`;
-					output += `${prefix}\t${t}\n`;
-				}
+				if (t.length > 1) output += `${prefix}${index}${tag}${attrs}>${t}</${node.tagName.toLowerCase()}>${options}\n`;
+				else output += `${prefix}${index}${tag}${attrs} />${options}\n`;
 
 				// Iframes: hint at content hidden below the iframe viewport (port of the upstream scroll hints)
 				if (node.hiddenElementsInfo && node.hiddenElementsInfo.length > 0) {

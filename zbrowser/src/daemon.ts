@@ -64,6 +64,11 @@ const BUNDLE_HASH: string | undefined = (() => {
   }
 })();
 const DOWNLOAD_MAX_AGE_MS = 7 * 24 * 3600_000;
+/** Third-party analytics/ads/beacons: never part of the page the model needs,
+ *  a large share of the requests that keep "network idle" from arriving, and
+ *  invisible to the user. Blocked at the context; the page itself is untouched. */
+const BLOCKED_HOSTS = /(^|\.)(googletagmanager\.com|google-analytics\.com|analytics\.google\.com|doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.com|facebook\.net|connect\.facebook\.net|hotjar\.com|fullstory\.com|segment\.io|segment\.com|mixpanel\.com|optimizely\.com|newrelic\.com|nr-data\.net|datadoghq\.com|browser-intake-datadoghq\.com|sentry\.io|bugsnag\.com|clarity\.ms|quantserve\.com|scorecardresearch\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amplitude\.com|braze\.com|appsflyer\.com|adroll\.com|bing\.com\/bat|tiktok\.com\/i18n\/pixel|snap\.com\/tr|pinterest\.com\/ct|linkedin\.com\/px|adsrvr\.org|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|amazon-adsystem\.com)$/i;
+const BLOCKED_PATHS = /\/(?:tr|pixel|beacon|collect|batch|track|analytics|gtm\.js|fbevents\.js|hotjar-[^/]+\.js)(?:[?/]|$)/i;
 
 // ─── config (env, set by the backend when it launches the daemon) ───────────
 const WORKSPACE = process.env.ZB_WORKSPACE || path.join(os.homedir(), 'workspace');
@@ -259,6 +264,7 @@ class Daemon {
         ],
       });
       await session.start();
+      await this.blockTrackers(session);
       this.session = session;
       return session;
     })();
@@ -266,6 +272,38 @@ class Daemon {
       return await this.starting;
     } finally {
       this.starting = null;
+    }
+  }
+
+  /** Route third-party trackers to a fast abort. Best effort; the page never notices. */
+  private async blockTrackers(session: BrowserSession): Promise<void> {
+    try {
+      const context: any = (session as any).context;
+      if (!context || typeof context.route !== 'function') return;
+      let blocked = 0;
+      await context.route('**/*', (route: any) => {
+        try {
+          const url = new URL(route.request().url());
+          const pageHost = (() => {
+            try {
+              return new URL(route.request().frame()?.url() || '').hostname;
+            } catch {
+              return '';
+            }
+          })();
+          const thirdParty = pageHost && !url.hostname.endsWith(pageHost.replace(/^www\./, ''));
+          if (BLOCKED_HOSTS.test(url.hostname) || (thirdParty && BLOCKED_PATHS.test(url.pathname))) {
+            blocked++;
+            return route.abort('blockedbyclient');
+          }
+        } catch {
+          /* fall through */
+        }
+        return route.continue();
+      });
+      log(`tracker blocking on (${blocked} blocked so far)`);
+    } catch (err: any) {
+      log(`tracker blocking unavailable: ${err?.message}`);
     }
   }
 

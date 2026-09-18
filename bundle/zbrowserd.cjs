@@ -35686,8 +35686,8 @@ var DOMService = class _DOMService {
           if (attributesToInclude["expanded"] && attributesToInclude["aria-expanded"]) {
             delete attributesToInclude["aria-expanded"];
           }
-          const text = node.text?.trim().toLowerCase() || "";
-          for (const attr of ["aria-label", "placeholder", "title"]) {
+          const text = node.text?.replace(/\s+/g, " ").trim().toLowerCase() || "";
+          for (const attr of ["aria-label", "placeholder", "title", "ax_name"]) {
             if (attributesToInclude[attr]?.trim().toLowerCase() === text) {
               delete attributesToInclude[attr];
             }
@@ -35705,20 +35705,17 @@ var DOMService = class _DOMService {
             attrs = " " + attrPairs.join(" ");
           }
         }
-        output += `${prefix}${index}${tag}${attrs} />`;
+        let t2 = node.text ? node.text.replace(/\s+/g, " ").trim() : "";
+        if (t2.length > ELEMENT_TEXT_MAX_CHARS) t2 = `${t2.slice(0, ELEMENT_TEXT_MAX_CHARS)}\u2026`;
+        let options = "";
         if (node.tagName.toLowerCase() === "select" && node.children.length > 0) {
-          const options = this.extractSelectOptions(node.children);
-          if (options.length > 0) {
-            output += ` [options: ${options.join(", ")}]`;
-          }
+          const opts = this.extractSelectOptions(node.children);
+          if (opts.length > 0) options = ` [options: ${opts.join(", ")}]`;
         }
-        output += "\n";
-        if (node.text && node.text.trim().length > 1) {
-          let t2 = node.text.replace(/\s+/g, " ").trim();
-          if (t2.length > ELEMENT_TEXT_MAX_CHARS) t2 = `${t2.slice(0, ELEMENT_TEXT_MAX_CHARS)}\u2026`;
-          output += `${prefix}	${t2}
+        if (t2.length > 1) output += `${prefix}${index}${tag}${attrs}>${t2}</${node.tagName.toLowerCase()}>${options}
 `;
-        }
+        else output += `${prefix}${index}${tag}${attrs} />${options}
+`;
         if (node.hiddenElementsInfo && node.hiddenElementsInfo.length > 0) {
           output += `${prefix}	... (${node.hiddenElementsInfo.length} more elements below - scroll to reveal):
 `;
@@ -55487,7 +55484,11 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
     }
   }
   if (actions.length > max && !interrupted) interrupted = `Only the first ${max} actions were run.`;
-  if (results.some((r2) => r2.ok)) await settleAfterActions(session);
+  if (results.some((r2) => r2.ok)) {
+    const ran = results.filter((r2) => r2.ok).map((r2) => r2.action);
+    const light = ran.every((a2) => LIGHT_ACTIONS.has(a2)) && !ran.some((a2, i2) => a2 === "send_keys" && /enter|return/i.test(String(results[i2]?.message || "")));
+    await settleAfterActions(session, light ? { light: true } : void 0);
+  }
   return { ok: results.length > 0 && results.every((r2) => r2.ok), results, interrupted };
 }
 async function settleBetweenActions(session) {
@@ -55498,9 +55499,15 @@ async function settleBetweenActions(session) {
   } catch {
   }
 }
-async function settleAfterActions(session) {
+var LIGHT_ACTIONS = /* @__PURE__ */ new Set(["scroll", "input", "select_dropdown", "dropdown_options", "find_text", "search_page", "find_elements", "extract", "wait"]);
+async function settleAfterActions(session, opts = {}) {
   try {
     const page = session.getPageOrCurrent();
+    if (opts.light) {
+      await new Promise((resolve2) => setTimeout(resolve2, 250));
+      await waitUntilStable(page, { maxMs: 900, intervalMs: 300 });
+      return;
+    }
     await page.waitForLoadState("domcontentloaded", { timeout: 2e3 }).catch(() => void 0);
     const idle = session.waitForNetworkIdle;
     if (typeof idle === "function") await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => void 0);
@@ -55549,6 +55556,8 @@ var BUNDLE_HASH = (() => {
   }
 })();
 var DOWNLOAD_MAX_AGE_MS = 7 * 24 * 36e5;
+var BLOCKED_HOSTS = /(^|\.)(googletagmanager\.com|google-analytics\.com|analytics\.google\.com|doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.com|facebook\.net|connect\.facebook\.net|hotjar\.com|fullstory\.com|segment\.io|segment\.com|mixpanel\.com|optimizely\.com|newrelic\.com|nr-data\.net|datadoghq\.com|browser-intake-datadoghq\.com|sentry\.io|bugsnag\.com|clarity\.ms|quantserve\.com|scorecardresearch\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amplitude\.com|braze\.com|appsflyer\.com|adroll\.com|bing\.com\/bat|tiktok\.com\/i18n\/pixel|snap\.com\/tr|pinterest\.com\/ct|linkedin\.com\/px|adsrvr\.org|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|amazon-adsystem\.com)$/i;
+var BLOCKED_PATHS = /\/(?:tr|pixel|beacon|collect|batch|track|analytics|gtm\.js|fbevents\.js|hotjar-[^/]+\.js)(?:[?/]|$)/i;
 var WORKSPACE = process.env.ZB_WORKSPACE || path10.join(os4.homedir(), "workspace");
 var PROFILE_DIR = path10.join(WORKSPACE, ZB_PROFILE_DIR);
 var DOWNLOADS_DIR = path10.join(WORKSPACE, ZB_DOWNLOADS_DIR);
@@ -55708,6 +55717,7 @@ var Daemon = class {
         ]
       });
       await session.start();
+      await this.blockTrackers(session);
       this.session = session;
       return session;
     })();
@@ -55715,6 +55725,36 @@ var Daemon = class {
       return await this.starting;
     } finally {
       this.starting = null;
+    }
+  }
+  /** Route third-party trackers to a fast abort. Best effort; the page never notices. */
+  async blockTrackers(session) {
+    try {
+      const context = session.context;
+      if (!context || typeof context.route !== "function") return;
+      let blocked = 0;
+      await context.route("**/*", (route) => {
+        try {
+          const url = new URL(route.request().url());
+          const pageHost = (() => {
+            try {
+              return new URL(route.request().frame()?.url() || "").hostname;
+            } catch {
+              return "";
+            }
+          })();
+          const thirdParty = pageHost && !url.hostname.endsWith(pageHost.replace(/^www\./, ""));
+          if (BLOCKED_HOSTS.test(url.hostname) || thirdParty && BLOCKED_PATHS.test(url.pathname)) {
+            blocked++;
+            return route.abort("blockedbyclient");
+          }
+        } catch {
+        }
+        return route.continue();
+      });
+      log(`tracker blocking on (${blocked} blocked so far)`);
+    } catch (err) {
+      log(`tracker blocking unavailable: ${err?.message}`);
     }
   }
   async closeBrowser() {

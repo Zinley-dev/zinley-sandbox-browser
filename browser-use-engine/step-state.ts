@@ -390,7 +390,13 @@ export async function runStepActions(
 		}
 	}
 	if (actions.length > max && !interrupted) interrupted = `Only the first ${max} actions were run.`;
-	if (results.some(r => r.ok)) await settleAfterActions(session);
+	if (results.some(r => r.ok)) {
+		// Typing, scrolling or picking an option does not load anything: a full
+		// settle (network idle + stability polling) would add ~1 s for nothing.
+		const ran = results.filter(r => r.ok).map(r => r.action);
+		const light = ran.every(a => LIGHT_ACTIONS.has(a)) && !ran.some((a, i) => a === 'send_keys' && /enter|return/i.test(String(results[i]?.message || '')));
+		await settleAfterActions(session, light ? { light: true } : undefined);
+	}
 	return { ok: results.length > 0 && results.every(r => r.ok), results, interrupted };
 }
 
@@ -411,9 +417,17 @@ async function settleBetweenActions(session: BrowserSession): Promise<void> {
  * a suggestion dropdown — reading the DOM the same millisecond returns the
  * old page and the model acts on stale indices. Bounded (≤ ~2 s), never throws.
  */
-export async function settleAfterActions(session: BrowserSession): Promise<void> {
+const LIGHT_ACTIONS = new Set(['scroll', 'input', 'select_dropdown', 'dropdown_options', 'find_text', 'search_page', 'find_elements', 'extract', 'wait']);
+
+export async function settleAfterActions(session: BrowserSession, opts: { light?: boolean } = {}): Promise<void> {
 	try {
 		const page: any = session.getPageOrCurrent();
+		if (opts.light) {
+			// Enough for a suggestion dropdown or a re-rendered list to appear.
+			await new Promise(resolve => setTimeout(resolve, 250));
+			await waitUntilStable(page, { maxMs: 900, intervalMs: 300 });
+			return;
+		}
 		await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => undefined);
 		const idle = (session as any).waitForNetworkIdle;
 		// The engine's helper counts in SECONDS.
