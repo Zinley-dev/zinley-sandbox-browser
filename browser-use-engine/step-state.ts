@@ -86,6 +86,17 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		out.interactiveCount = selectorMap?.size ?? 0;
 		let elements: string = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? '', selectorMap);
 		if (lastDelta) out.delta = lastDelta;
+		// Several looks at the same page with nothing changing is the model going
+		// in circles (re-reading, re-clicking a dead control). Say it, every few steps.
+		const memo = loopMemo.get(session as object) ?? { url: '', stuck: 0, sameFail: 0 };
+		memo.stuck = memo.url === out.url && /nothing new/.test(lastDelta || '') ? memo.stuck + 1 : 0;
+		memo.url = out.url;
+		loopMemo.set(session as object, memo);
+		if (memo.stuck > 0 && memo.stuck % STUCK_EVERY === 0) {
+			out.notes.push(
+				`${memo.stuck + 1} steps on this page with nothing changing — you may be looping. Check the screenshot for what actually happened; scroll or find_text for the target; or take another route (direct URL, search, go_back). Do not repeat the last action.`,
+			);
+		}
 		// Almost nothing on a real URL: still rendering, or a bot wall. Say so
 		// instead of letting the model conclude the site has no such button.
 		if (out.interactiveCount <= 3 && elements.replace(/\s+/g, ' ').length < 200 && /^https?:/i.test(out.url)) {
@@ -164,6 +175,10 @@ async function getStateWithPage(session: BrowserSession): Promise<any> {
 }
 
 const lastSeen = new WeakMap<object, { url: string; ids: Set<number> }>();
+/** Per-session loop awareness: how many captures in a row saw the same page
+ *  with nothing new, and the last action that failed (to catch a blind retry). */
+const loopMemo = new WeakMap<object, { url: string; stuck: number; lastFailKey?: string; lastFailUrl?: string; sameFail: number }>();
+const STUCK_EVERY = 4;
 /** Set by markNewElements for the capture in progress (one capture at a time per session). */
 let lastDelta: string | undefined;
 const INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
@@ -336,6 +351,23 @@ export async function runStepActions(
 			results.push({ action, ok: !error, message, error });
 			if (error) {
 				interrupted = notRun(i).trim() || undefined;
+				// The same action with the same params failing twice on the same
+				// page is a blind retry, not a new attempt: name it.
+				let key = action;
+				try {
+					key = `${action}:${JSON.stringify(params ?? {})}`;
+				} catch {
+					/* key stays the action */
+				}
+				const url = await session.getCurrentPageUrl().catch(() => '');
+				const memo = loopMemo.get(session as object) ?? { url: '', stuck: 0, sameFail: 0 };
+				memo.sameFail = memo.lastFailKey === key && memo.lastFailUrl === url ? memo.sameFail + 1 : 1;
+				memo.lastFailKey = key;
+				memo.lastFailUrl = url;
+				loopMemo.set(session as object, memo);
+				if (memo.sameFail >= 2) {
+					interrupted = `${interrupted ? `${interrupted} ` : ''}'${action}' with these exact params has now failed ${memo.sameFail} times on this page — do not try it again: read the elements and screenshot, pick a different element, or use find_text / a direct URL / go_back.`;
+				}
 				break;
 			}
 		} catch (err: any) {

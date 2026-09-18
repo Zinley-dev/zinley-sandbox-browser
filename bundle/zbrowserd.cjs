@@ -55274,6 +55274,15 @@ async function captureStepState(session, opts = {}) {
     out.interactiveCount = selectorMap?.size ?? 0;
     let elements = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "", selectorMap);
     if (lastDelta) out.delta = lastDelta;
+    const memo = loopMemo.get(session) ?? { url: "", stuck: 0, sameFail: 0 };
+    memo.stuck = memo.url === out.url && /nothing new/.test(lastDelta || "") ? memo.stuck + 1 : 0;
+    memo.url = out.url;
+    loopMemo.set(session, memo);
+    if (memo.stuck > 0 && memo.stuck % STUCK_EVERY === 0) {
+      out.notes.push(
+        `${memo.stuck + 1} steps on this page with nothing changing \u2014 you may be looping. Check the screenshot for what actually happened; scroll or find_text for the target; or take another route (direct URL, search, go_back). Do not repeat the last action.`
+      );
+    }
     if (out.interactiveCount <= 3 && elements.replace(/\s+/g, " ").length < 200 && /^https?:/i.test(out.url)) {
       out.notes.push('Almost no content on this page \u2014 it may still be rendering or be a bot wall: wait{seconds:3} then op="state"; if it stays empty, try another route or tell the user.');
     }
@@ -55345,6 +55354,8 @@ async function getStateWithPage(session) {
   }
 }
 var lastSeen = /* @__PURE__ */ new WeakMap();
+var loopMemo = /* @__PURE__ */ new WeakMap();
+var STUCK_EVERY = 4;
 var lastDelta;
 var INDEX_LINE = /^([ \t]*)\*?\[(\d+)\]/gm;
 function markNewElements(session, url, elements, selectorMap) {
@@ -55440,6 +55451,20 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
       results.push({ action, ok: !error, message, error });
       if (error) {
         interrupted = notRun(i2).trim() || void 0;
+        let key = action;
+        try {
+          key = `${action}:${JSON.stringify(params ?? {})}`;
+        } catch {
+        }
+        const url = await session.getCurrentPageUrl().catch(() => "");
+        const memo = loopMemo.get(session) ?? { url: "", stuck: 0, sameFail: 0 };
+        memo.sameFail = memo.lastFailKey === key && memo.lastFailUrl === url ? memo.sameFail + 1 : 1;
+        memo.lastFailKey = key;
+        memo.lastFailUrl = url;
+        loopMemo.set(session, memo);
+        if (memo.sameFail >= 2) {
+          interrupted = `${interrupted ? `${interrupted} ` : ""}'${action}' with these exact params has now failed ${memo.sameFail} times on this page \u2014 do not try it again: read the elements and screenshot, pick a different element, or use find_text / a direct URL / go_back.`;
+        }
         break;
       }
     } catch (err) {
