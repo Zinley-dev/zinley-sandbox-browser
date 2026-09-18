@@ -57,6 +57,8 @@ export interface PageState {
 	/** Selector map keyed by backendNodeId (like Python) */
 	selectorMap: Map<number, EnhancedDOMTreeNode>;
 	viewportInfo?: ViewportInfo;
+	/** Elements that look like a dialog / cookie banner / overlay covering the page. */
+	modalOverlays?: Array<{ backendNodeId: number; nodeName: string; reason: string }>;
 }
 
 export interface ViewportInfo {
@@ -2481,6 +2483,7 @@ export class DOMService {
 			domTree: domTreeNodes,
 			selectorMap: filteredSelectorMap,
 			viewportInfo,
+			modalOverlays,
 		};
 
 		// Take screenshot if requested

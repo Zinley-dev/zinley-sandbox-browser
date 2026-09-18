@@ -2737,17 +2737,20 @@ export class BrowserSession {
 			};
 
 			// DOM extraction using DOMService
+			let lastPageState: PageState | null = null;
 			if (event.includeDom !== false) {
 				let domService: DOMService | null = null;
 				try {
 					domService = new DOMService(page, {
 						paintOrderFiltering: true,
 						crossOriginIframes: false,
+						...((event as any).viewportThreshold !== undefined ? { viewportThreshold: (event as any).viewportThreshold } : {}),
 					});
 					const pageState = await domService.getPageState({
 						includeScreenshot: false, // Will capture separately
 						useCDPAccessibility: true,
 					});
+					lastPageState = pageState;
 
 					// Update cached selector map
 					this.updateCachedSelectorMap(pageState.selectorMap);
@@ -2793,6 +2796,7 @@ export class BrowserSession {
 				isPdfViewer: page.url().endsWith('.pdf') || page.url().includes('chrome-extension://') && page.url().includes('pdf'),
 				pendingNetworkRequests: [],
 				paginationButtons: [],
+				modalOverlays: lastPageState?.modalOverlays,
 				closedPopupMessages: this.drainClosedPopupMessages(),
 			};
 
@@ -3415,6 +3419,9 @@ export class BrowserSession {
 		includeScreenshot?: boolean;
 		includeDom?: boolean;
 		includeRecentEvents?: boolean;
+		/** Pixels beyond the viewport to still list (default 2000; a step-by-step
+		 *  driver wants ~one screen so a results page fits its budget). */
+		viewportThreshold?: number | null;
 	} = {}): Promise<BrowserStateSummary> {
 		return this.eventBus.dispatch<BrowserStateSummary>(
 			BrowserEventNames.BROWSER_STATE_REQUEST,
@@ -3422,6 +3429,7 @@ export class BrowserSession {
 				includeScreenshot: options.includeScreenshot ?? true,
 				includeDom: options.includeDom ?? true,
 				includeRecentEvents: options.includeRecentEvents ?? false,
+				...(options.viewportThreshold !== undefined ? { viewportThreshold: options.viewportThreshold } : {}),
 			},
 			TIMEOUTS.BROWSER_STATE_REQUEST
 		);

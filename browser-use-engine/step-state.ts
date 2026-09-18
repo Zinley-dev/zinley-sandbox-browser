@@ -131,6 +131,16 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 			out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(' | ')}`);
 		}
 		if (state.stateError) out.notes.push(String(state.stateError));
+		// A dialog / cookie banner / overlay in front of the page: the engine
+		// detected it but only logged it — the model must close it first.
+		const overlays: Array<{ backendNodeId: number; nodeName: string; reason: string }> = Array.isArray(state.modalOverlays) ? state.modalOverlays : [];
+		// Only explicit dialogs: class-name and "semi-transparent overlay" guesses
+		// fire on Amazon's hidden flyout backdrops on every step.
+		const dialog = overlays.find(o => /role=(?:dialog|alertdialog)|aria-modal/i.test(o.reason));
+		if (dialog) {
+			const label = selectorMap?.get(dialog.backendNodeId) ? `[${dialog.backendNodeId}]` : `<${dialog.nodeName}>`;
+			out.notes.push(`A dialog or overlay ${label} appears to be covering the page (${dialog.reason}) — deal with it first (Accept / Close / ✕ / Esc) before acting on anything behind it.`);
+		}
 		if (state.isPdfViewer) out.notes.push('This is a PDF viewer — extract cannot read it; scroll to read it, or download the file.');
 	}
 	if (wantShot) {
@@ -157,7 +167,11 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 	return out;
 }
 
-const STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false };
+/** Pixels beyond the viewport still listed. Measured on Amazon's results page:
+ *  2000 px (engine default) → 725 controls / 39k chars, 800 → 399 / 22k,
+ *  300 → 261 / 15.5k (fits the 16k budget with every visible price), 0 → 222. */
+const STEP_VIEWPORT_THRESHOLD = 300;
+const STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false, viewportThreshold: STEP_VIEWPORT_THRESHOLD };
 
 /** The site closed the last tab (or the model did): the engine throws "No
  *  active page" — open a blank one and read that instead of losing the step. */

@@ -35639,7 +35639,8 @@ var DOMService = class _DOMService {
       title: await this.page.title(),
       domTree: domTreeNodes,
       selectorMap: filteredSelectorMap,
-      viewportInfo
+      viewportInfo,
+      modalOverlays
     };
     if (options.includeScreenshot !== false) {
       const screenshot2 = await this.page.screenshot({ type: "png" });
@@ -38414,18 +38415,21 @@ var BrowserSession = class {
         root: null,
         selectorMap: /* @__PURE__ */ new Map()
       };
+      let lastPageState = null;
       if (event.includeDom !== false) {
         let domService = null;
         try {
           domService = new DOMService(page, {
             paintOrderFiltering: true,
-            crossOriginIframes: false
+            crossOriginIframes: false,
+            ...event.viewportThreshold !== void 0 ? { viewportThreshold: event.viewportThreshold } : {}
           });
           const pageState = await domService.getPageState({
             includeScreenshot: false,
             // Will capture separately
             useCDPAccessibility: true
           });
+          lastPageState = pageState;
           this.updateCachedSelectorMap(pageState.selectorMap);
           const domTree = pageState.domTree;
           const selectorMap = pageState.selectorMap;
@@ -38461,6 +38465,7 @@ var BrowserSession = class {
         isPdfViewer: page.url().endsWith(".pdf") || page.url().includes("chrome-extension://") && page.url().includes("pdf"),
         pendingNetworkRequests: [],
         paginationButtons: [],
+        modalOverlays: lastPageState?.modalOverlays,
         closedPopupMessages: this.drainClosedPopupMessages()
       };
       if (event.includeScreenshot !== false) {
@@ -38936,7 +38941,8 @@ var BrowserSession = class {
       {
         includeScreenshot: options.includeScreenshot ?? true,
         includeDom: options.includeDom ?? true,
-        includeRecentEvents: options.includeRecentEvents ?? false
+        includeRecentEvents: options.includeRecentEvents ?? false,
+        ...options.viewportThreshold !== void 0 ? { viewportThreshold: options.viewportThreshold } : {}
       },
       TIMEOUTS.BROWSER_STATE_REQUEST
     );
@@ -55339,6 +55345,12 @@ ${elements}`;
       out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(" | ")}`);
     }
     if (state.stateError) out.notes.push(String(state.stateError));
+    const overlays = Array.isArray(state.modalOverlays) ? state.modalOverlays : [];
+    const dialog = overlays.find((o2) => /role=(?:dialog|alertdialog)|aria-modal/i.test(o2.reason));
+    if (dialog) {
+      const label = selectorMap?.get(dialog.backendNodeId) ? `[${dialog.backendNodeId}]` : `<${dialog.nodeName}>`;
+      out.notes.push(`A dialog or overlay ${label} appears to be covering the page (${dialog.reason}) \u2014 deal with it first (Accept / Close / \u2715 / Esc) before acting on anything behind it.`);
+    }
     if (state.isPdfViewer) out.notes.push("This is a PDF viewer \u2014 extract cannot read it; scroll to read it, or download the file.");
   }
   if (wantShot) {
@@ -55363,7 +55375,8 @@ ${elements}`;
   }
   return out;
 }
-var STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false };
+var STEP_VIEWPORT_THRESHOLD = 300;
+var STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false, viewportThreshold: STEP_VIEWPORT_THRESHOLD };
 async function getStateWithPage(session) {
   try {
     return await session.getState(STATE_OPTS);

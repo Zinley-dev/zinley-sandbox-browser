@@ -130,6 +130,8 @@ export interface BrowserStateSummary {
 	paginationButtons: PaginationButton[]; // Detected pagination buttons
 	/** Messages from auto-closed JavaScript dialogs since the last state */
 	closedPopupMessages?: string[];
+	/** Dialog / cookie banner / overlay candidates covering the page (from the DOM service). */
+	modalOverlays?: Array<{ backendNodeId: number; nodeName: string; reason: string }>;
 	/** Safe, model-visible explanation when the current state could not be captured */
 	stateError?: string | null;
 }
