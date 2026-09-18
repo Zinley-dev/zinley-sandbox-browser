@@ -496,6 +496,11 @@ export async function runStepActions(
 async function retarget(session: BrowserSession, index: number): Promise<{ index: number; how: string } | null> {
 	const ident = lastNodes.get(session as object)?.get(index);
 	if (!ident) return null;
+	// Only on the page the index came from: after a navigation "the only <a>
+	// named Next" is a different control on a different page.
+	const from = lastSeen.get(session as object)?.url;
+	const now = await session.getCurrentPageUrl().catch(() => '');
+	if (from && now && from !== now) return null;
 	let state: any = null;
 	try {
 		state = await getStateWithPage(session);

@@ -64,10 +64,13 @@ const BUNDLE_HASH: string | undefined = (() => {
   }
 })();
 const DOWNLOAD_MAX_AGE_MS = 7 * 24 * 3600_000;
-/** Third-party analytics/ads/beacons: never part of the page the model needs,
+/** Third-party analytics/ads/beacons: never part of the page the model needs.
+ *  NOT the Facebook/Google SDKs themselves (connect.facebook.net serves the
+ *  "Log in with Facebook" button) — only their pixels, via BLOCKED_PATHS.
+ *  Never part of the page,
  *  a large share of the requests that keep "network idle" from arriving, and
  *  invisible to the user. Blocked at the context; the page itself is untouched. */
-const BLOCKED_HOSTS = /(^|\.)(googletagmanager\.com|google-analytics\.com|analytics\.google\.com|doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.com|facebook\.net|connect\.facebook\.net|hotjar\.com|fullstory\.com|segment\.io|segment\.com|mixpanel\.com|optimizely\.com|newrelic\.com|nr-data\.net|datadoghq\.com|browser-intake-datadoghq\.com|sentry\.io|bugsnag\.com|clarity\.ms|quantserve\.com|scorecardresearch\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amplitude\.com|braze\.com|appsflyer\.com|adroll\.com|bing\.com\/bat|tiktok\.com\/i18n\/pixel|snap\.com\/tr|pinterest\.com\/ct|linkedin\.com\/px|adsrvr\.org|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|amazon-adsystem\.com)$/i;
+const BLOCKED_HOSTS = /(^|\.)(googletagmanager\.com|google-analytics\.com|analytics\.google\.com|doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.com|hotjar\.com|fullstory\.com|segment\.io|segment\.com|mixpanel\.com|optimizely\.com|newrelic\.com|nr-data\.net|datadoghq\.com|browser-intake-datadoghq\.com|sentry\.io|bugsnag\.com|clarity\.ms|quantserve\.com|scorecardresearch\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amplitude\.com|braze\.com|appsflyer\.com|adroll\.com|bing\.com\/bat|tiktok\.com\/i18n\/pixel|snap\.com\/tr|pinterest\.com\/ct|linkedin\.com\/px|adsrvr\.org|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|amazon-adsystem\.com)$/i;
 const BLOCKED_PATHS = /\/(?:tr|pixel|beacon|collect|batch|track|analytics|gtm\.js|fbevents\.js|hotjar-[^/]+\.js)(?:[?/]|$)/i;
 
 // ─── config (env, set by the backend when it launches the daemon) ───────────

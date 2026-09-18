@@ -55593,6 +55593,9 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
 async function retarget(session, index) {
   const ident = lastNodes.get(session)?.get(index);
   if (!ident) return null;
+  const from = lastSeen.get(session)?.url;
+  const now = await session.getCurrentPageUrl().catch(() => "");
+  if (from && now && from !== now) return null;
   let state = null;
   try {
     state = await getStateWithPage(session);
@@ -55685,7 +55688,7 @@ var BUNDLE_HASH = (() => {
   }
 })();
 var DOWNLOAD_MAX_AGE_MS = 7 * 24 * 36e5;
-var BLOCKED_HOSTS = /(^|\.)(googletagmanager\.com|google-analytics\.com|analytics\.google\.com|doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.com|facebook\.net|connect\.facebook\.net|hotjar\.com|fullstory\.com|segment\.io|segment\.com|mixpanel\.com|optimizely\.com|newrelic\.com|nr-data\.net|datadoghq\.com|browser-intake-datadoghq\.com|sentry\.io|bugsnag\.com|clarity\.ms|quantserve\.com|scorecardresearch\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amplitude\.com|braze\.com|appsflyer\.com|adroll\.com|bing\.com\/bat|tiktok\.com\/i18n\/pixel|snap\.com\/tr|pinterest\.com\/ct|linkedin\.com\/px|adsrvr\.org|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|amazon-adsystem\.com)$/i;
+var BLOCKED_HOSTS = /(^|\.)(googletagmanager\.com|google-analytics\.com|analytics\.google\.com|doubleclick\.net|googlesyndication\.com|googleadservices\.com|adservice\.google\.com|hotjar\.com|fullstory\.com|segment\.io|segment\.com|mixpanel\.com|optimizely\.com|newrelic\.com|nr-data\.net|datadoghq\.com|browser-intake-datadoghq\.com|sentry\.io|bugsnag\.com|clarity\.ms|quantserve\.com|scorecardresearch\.com|criteo\.com|criteo\.net|taboola\.com|outbrain\.com|amplitude\.com|braze\.com|appsflyer\.com|adroll\.com|bing\.com\/bat|tiktok\.com\/i18n\/pixel|snap\.com\/tr|pinterest\.com\/ct|linkedin\.com\/px|adsrvr\.org|rubiconproject\.com|pubmatic\.com|openx\.net|casalemedia\.com|amazon-adsystem\.com)$/i;
 var BLOCKED_PATHS = /\/(?:tr|pixel|beacon|collect|batch|track|analytics|gtm\.js|fbevents\.js|hotjar-[^/]+\.js)(?:[?/]|$)/i;
 var WORKSPACE = process.env.ZB_WORKSPACE || path10.join(os4.homedir(), "workspace");
 var PROFILE_DIR = path10.join(WORKSPACE, ZB_PROFILE_DIR);
