@@ -135,7 +135,7 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		}
 		out.elements = elements;
 		if (Array.isArray(state.closedPopupMessages) && state.closedPopupMessages.length > 0) {
-			out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(' | ')}`);
+			for (const raw of state.closedPopupMessages) out.notes.push(describeDialog(String(raw)));
 		}
 		if (state.stateError) out.notes.push(String(state.stateError));
 		// Files the browser saved since the last look: the model needs the path
@@ -202,6 +202,22 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
  *  2000 px (engine default) → 725 controls / 39k chars, 800 → 399 / 22k,
  *  300 → 261 / 15.5k (fits the 16k budget with every visible price), 0 → 222. */
 const STEP_VIEWPORT_THRESHOLD = 300;
+/**
+ * The engine answers JavaScript dialogs itself (it cannot leave one open):
+ * alert → OK, confirm / beforeunload → OK, prompt → Cancel. Say which, in
+ * words — "auto-closed" hid that a site's "Are you sure you want to delete?"
+ * was answered YES on the model's behalf.
+ */
+export function describeDialog(raw: string): string {
+	const m = /^\[(\w+)\]\s*([\s\S]*)$/.exec(raw);
+	const type = (m?.[1] || 'dialog').toLowerCase();
+	const msg = (m ? m[2] : raw).replace(/\s+/g, ' ').trim().slice(0, 200);
+	if (type === 'confirm') return `The page asked "${msg}" and it was answered OK automatically — whatever it was confirming has now happened.`;
+	if (type === 'beforeunload') return `The page warned before leaving ("${msg}") and it was answered Leave automatically.`;
+	if (type === 'prompt') return `The page asked for text ("${msg}"); it was cancelled — there is no way to type into that box.`;
+	return `The page showed a message: "${msg}".`;
+}
+
 const STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false, viewportThreshold: STEP_VIEWPORT_THRESHOLD };
 
 /** The site closed the last tab (or the model did): the engine throws "No
@@ -413,16 +429,20 @@ export function registerStepActions(registry: ActionRegistry): void {
 			if (x === undefined || y === undefined) {
 				const p = node.absolutePosition || node.snapshotNode?.bounds;
 				if (!p || !(p.width > 0) || !(p.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
-				x = p.x + p.width / 2;
-				y = p.y + p.height / 2;
+				let cx: number = p.x + p.width / 2;
+				let cy: number = p.y + p.height / 2;
 				if (!node.absolutePosition) {
 					// snapshot bounds are document-relative; the mouse wants viewport coordinates
 					const [sx, sy] = (await page.evaluate('[window.scrollX, window.scrollY]').catch(() => [0, 0])) as number[];
-					x -= sx;
-					y -= sy;
+					cx -= sx;
+					cy -= sy;
 				}
+				x = cx;
+				y = cy;
 			}
-			await page.mouse.move(x, y, { steps: 6 });
+			const mx: number = x;
+			const my: number = y;
+			await page.mouse.move(mx, my, { steps: 6 });
 			await new Promise(resolve => setTimeout(resolve, 250));
 			const tag = String(node.nodeName || node.tagName || 'element').toLowerCase();
 			const name = String(node.axNode?.name || node.text || '').trim().slice(0, 60);
@@ -552,7 +572,8 @@ export async function runStepActions(
 				interrupted = `'${action}' changes the page or tab, so the indices you chose no longer apply;${notRun(i)} Look at the page first.`;
 				break;
 			}
-			await settleBetweenActions(session);
+			// Typing into one field then the next loads nothing: no pause there.
+			if (!LIGHT_ACTIONS.has(action)) await settleBetweenActions(session);
 			const urlAfter = await session.getCurrentPageUrl().catch(() => '');
 			if (urlAfter && urlBefore && urlAfter !== urlBefore) {
 				interrupted = `The page changed after '${action}' (${urlAfter});${notRun(i)} Look at the new page first.`;
@@ -696,10 +717,19 @@ export async function waitUntilStable(page: any, opts: { maxMs?: number; interva
 	const intervalMs = opts.intervalMs ?? 300;
 	const started = Date.now();
 	let last = '';
+	let same = 0;
 	try {
 		while (Date.now() - started < maxMs) {
 			const cur = String(await page.evaluate(STABLE_PROBE).catch(() => ''));
-			if (cur && cur === last && cur.startsWith('complete')) return;
+			if (cur && cur === last) {
+				same++;
+				// "complete" + two equal readings, or three equal readings on a page
+				// that never reaches "complete" (one hanging ad or font request kept
+				// every such page waiting the full budget).
+				if (cur.startsWith('complete') || same >= 2) return;
+			} else {
+				same = 0;
+			}
 			last = cur;
 			await new Promise(resolve => setTimeout(resolve, intervalMs));
 		}

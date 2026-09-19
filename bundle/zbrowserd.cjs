@@ -55349,7 +55349,7 @@ ${elements}`;
     }
     out.elements = elements;
     if (Array.isArray(state.closedPopupMessages) && state.closedPopupMessages.length > 0) {
-      out.notes.push(`Auto-closed JavaScript dialog(s): ${state.closedPopupMessages.join(" | ")}`);
+      for (const raw of state.closedPopupMessages) out.notes.push(describeDialog(String(raw)));
     }
     if (state.stateError) out.notes.push(String(state.stateError));
     try {
@@ -55403,6 +55403,15 @@ ${elements}`;
   return out;
 }
 var STEP_VIEWPORT_THRESHOLD = 300;
+function describeDialog(raw) {
+  const m2 = /^\[(\w+)\]\s*([\s\S]*)$/.exec(raw);
+  const type = (m2?.[1] || "dialog").toLowerCase();
+  const msg = (m2 ? m2[2] : raw).replace(/\s+/g, " ").trim().slice(0, 200);
+  if (type === "confirm") return `The page asked "${msg}" and it was answered OK automatically \u2014 whatever it was confirming has now happened.`;
+  if (type === "beforeunload") return `The page warned before leaving ("${msg}") and it was answered Leave automatically.`;
+  if (type === "prompt") return `The page asked for text ("${msg}"); it was cancelled \u2014 there is no way to type into that box.`;
+  return `The page showed a message: "${msg}".`;
+}
 var STATE_OPTS = { includeScreenshot: false, includeDom: true, includeRecentEvents: false, viewportThreshold: STEP_VIEWPORT_THRESHOLD };
 async function getStateWithPage(session) {
   try {
@@ -55566,15 +55575,19 @@ function registerStepActions(registry) {
       if (x2 === void 0 || y2 === void 0) {
         const p2 = node.absolutePosition || node.snapshotNode?.bounds;
         if (!p2 || !(p2.width > 0) || !(p2.height > 0)) return { error: `Element [${params.index}] has no position to hover.` };
-        x2 = p2.x + p2.width / 2;
-        y2 = p2.y + p2.height / 2;
+        let cx = p2.x + p2.width / 2;
+        let cy = p2.y + p2.height / 2;
         if (!node.absolutePosition) {
           const [sx, sy] = await page.evaluate("[window.scrollX, window.scrollY]").catch(() => [0, 0]);
-          x2 -= sx;
-          y2 -= sy;
+          cx -= sx;
+          cy -= sy;
         }
+        x2 = cx;
+        y2 = cy;
       }
-      await page.mouse.move(x2, y2, { steps: 6 });
+      const mx = x2;
+      const my = y2;
+      await page.mouse.move(mx, my, { steps: 6 });
       await new Promise((resolve3) => setTimeout(resolve3, 250));
       const tag = String(node.nodeName || node.tagName || "element").toLowerCase();
       const name = String(node.axNode?.name || node.text || "").trim().slice(0, 60);
@@ -55643,7 +55656,7 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
         interrupted = `'${action}' changes the page or tab, so the indices you chose no longer apply;${notRun(i2)} Look at the page first.`;
         break;
       }
-      await settleBetweenActions(session);
+      if (!LIGHT_ACTIONS.has(action)) await settleBetweenActions(session);
       const urlAfter = await session.getCurrentPageUrl().catch(() => "");
       if (urlAfter && urlBefore && urlAfter !== urlBefore) {
         interrupted = `The page changed after '${action}' (${urlAfter});${notRun(i2)} Look at the new page first.`;
@@ -55746,10 +55759,16 @@ async function waitUntilStable(page, opts = {}) {
   const intervalMs = opts.intervalMs ?? 300;
   const started = Date.now();
   let last = "";
+  let same = 0;
   try {
     while (Date.now() - started < maxMs) {
       const cur = String(await page.evaluate(STABLE_PROBE).catch(() => ""));
-      if (cur && cur === last && cur.startsWith("complete")) return;
+      if (cur && cur === last) {
+        same++;
+        if (cur.startsWith("complete") || same >= 2) return;
+      } else {
+        same = 0;
+      }
       last = cur;
       await new Promise((resolve3) => setTimeout(resolve3, intervalMs));
     }
@@ -55772,7 +55791,7 @@ var HANDOFF_LINE_RE = new RegExp(`^[ \\t]*\`{0,3}[ \\t]*${ZB_HANDOFF_MARKER}[ \\
 var HANDOFF_LINE_RE_G = new RegExp(HANDOFF_LINE_RE.source, "gm");
 
 // sandbox-runtime/zbrowser/src/daemon.ts
-var VERSION2 = true ? "2026-09-18-ec970e4" : "dev";
+var VERSION2 = true ? "2026-09-19-ec970e4" : "dev";
 var BUNDLE_HASH = (() => {
   try {
     return String(JSON.parse(fs11.readFileSync(path10.join(__dirname, "manifest.json"), "utf8")).hash || "") || void 0;
