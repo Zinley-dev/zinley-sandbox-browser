@@ -87,6 +87,8 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		out.interactiveCount = selectorMap?.size ?? 0;
 		let elements: string = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? '', selectorMap);
 		if (lastDelta) out.delta = lastDelta;
+		// Count what the model can see listed (entries left out as noise are not).
+		if (elements) out.interactiveCount = indicesIn(elements).size;
 		// Several looks at the same page with nothing changing is the model going
 		// in circles (re-reading, re-clicking a dead control). Say it, every few steps.
 		const memo = loopMemo.get(session as object) ?? { url: '', stuck: 0, sameFail: 0 };
@@ -183,7 +185,8 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		}
 		let highlighted = false;
 		if (page && opts.highlight !== false && selectorMap && selectorMap.size > 0) {
-			highlighted = await drawIndexOverlay(page, selectorMap, out.elementsTruncated ? indicesIn(out.elements) : undefined);
+			// Number exactly what the text lists (not the entries left out as noise or cut by the budget).
+			highlighted = await drawIndexOverlay(page, selectorMap, indicesIn(out.elements));
 		}
 		if (page) try {
 			// CSS-pixel scale: a Retina desktop would otherwise send a 2× image (4× the bytes and tokens).
@@ -538,7 +541,10 @@ export async function runStepActions(
 			}
 			const gone = isGone(r);
 			const error = r.error || (gone ? `${String(r.extractedContent)} It is not on the page any more (the page redrew or moved on) — look again before choosing.` : undefined);
-			const message = error ? undefined : ([r.extractedContent, r.longTermMemory].filter(Boolean).join('\n') || undefined) && `${[r.extractedContent, r.longTermMemory].filter(Boolean).join('\n')}${retargetNote}`;
+			// extractedContent and longTermMemory are often the same sentence: say it once.
+			const parts = [r.extractedContent, r.longTermMemory].filter(Boolean).map(String);
+			const unique = parts.filter((x, i) => !parts.slice(0, i).some(prev => prev === x || prev.includes(x)));
+			const message = error ? undefined : unique.length > 0 ? `${unique.join('\n')}${retargetNote}` : undefined;
 			results.push({ action, ok: !error, message, error });
 			if (error) {
 				interrupted = notRun(i).trim() || undefined;

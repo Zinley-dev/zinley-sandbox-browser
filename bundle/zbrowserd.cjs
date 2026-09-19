@@ -34133,6 +34133,8 @@ var DOMService = class _DOMService {
      */
     /** Last plain-text line emitted by formatDOMForLLM (dedupes a label repeated by nested wrappers). */
     this.lastEmittedText = "";
+    /** Per formatting pass: does this node have a listed interactive descendant? */
+    this.shownBelow = /* @__PURE__ */ new WeakMap();
     this.crossOriginIframes = options.crossOriginIframes ?? false;
     this.paintOrderFiltering = options.paintOrderFiltering ?? true;
     this.maxIframes = options.maxIframes ?? 100;
@@ -35651,11 +35653,28 @@ var DOMService = class _DOMService {
     console.log(`\u{1F4CB} [DOM] Extracted ${filteredSelectorMap.size} interactive elements with real backendNodeIds (${paintOrderFiltered} filtered by paint order, ${bboxFiltered} filtered by bbox)`);
     return state;
   }
-  formatDOMForLLM(domTree, indent = 0, showNewElements = true, selectorMap) {
+  hasListedInteractiveBelow(node, selectorMap) {
+    const cached = this.shownBelow.get(node);
+    if (cached !== void 0) return cached;
+    let found = false;
+    for (const child of node.children || []) {
+      if (child.isInteractive && (!selectorMap || selectorMap.has(child.index)) || this.hasListedInteractiveBelow(child, selectorMap)) {
+        found = true;
+        break;
+      }
+    }
+    this.shownBelow.set(node, found);
+    return found;
+  }
+  formatDOMForLLM(domTree, indent = 0, showNewElements = true, selectorMap, underShown = false) {
     let output = "";
-    if (indent === 0) this.lastEmittedText = "";
+    if (indent === 0) {
+      this.lastEmittedText = "";
+      this.shownBelow = /* @__PURE__ */ new WeakMap();
+    }
     for (const node of domTree) {
       const isInSelectorMap = !selectorMap || selectorMap.has(node.index);
+      let printedSelf = node.isInteractive && isInSelectorMap;
       if (node.isInteractive && isInSelectorMap) {
         const prefix = "	".repeat(indent);
         const newMarker = showNewElements && node.isNew ? "*" : "";
@@ -35731,7 +35750,12 @@ var DOMService = class _DOMService {
           const opts = this.extractSelectOptions(node.children);
           if (opts.length > 0) options = ` [options: ${opts.join(", ")}]`;
         }
-        if (t2.length > 1) output += `${prefix}${index}${tag}${attrs}>${t2}</${node.tagName.toLowerCase()}>${options}
+        const tagLower = node.tagName.toLowerCase();
+        const empty = t2.length <= 1 && attrs === "" && options === "";
+        const noise = tagLower === "source" || tagLower === "track" || empty && (underShown || this.hasListedInteractiveBelow(node, selectorMap));
+        if (noise) {
+          printedSelf = false;
+        } else if (t2.length > 1) output += `${prefix}${index}${tag}${attrs}>${t2}</${tagLower}>${options}
 `;
         else output += `${prefix}${index}${tag}${attrs} />${options}
 `;
@@ -35757,12 +35781,12 @@ var DOMService = class _DOMService {
       }
       if (node.children.length > 0) {
         if (node.tagName.toLowerCase() !== "select") {
-          const wasShown = node.isInteractive && isInSelectorMap;
           output += this.formatDOMForLLM(
             node.children,
-            indent + (wasShown ? 1 : 0),
+            indent + (printedSelf ? 1 : 0),
             showNewElements,
-            selectorMap
+            selectorMap,
+            underShown || printedSelf
           );
         }
       }
@@ -55304,6 +55328,7 @@ async function captureStepState(session, opts = {}) {
     out.interactiveCount = selectorMap?.size ?? 0;
     let elements = markNewElements(session, out.url, state.domState?.llmRepresentation?.(DEFAULT_INCLUDE_ATTRIBUTES) ?? "", selectorMap);
     if (lastDelta) out.delta = lastDelta;
+    if (elements) out.interactiveCount = indicesIn(elements).size;
     const memo = loopMemo.get(session) ?? { url: "", stuck: 0, sameFail: 0 };
     if (memo.at && Date.now() - memo.at > LOOP_MEMO_GAP_MS) {
       memo.stuck = 0;
@@ -55389,7 +55414,7 @@ ${elements}`;
     }
     let highlighted = false;
     if (page && opts.highlight !== false && selectorMap && selectorMap.size > 0) {
-      highlighted = await drawIndexOverlay(page, selectorMap, out.elementsTruncated ? indicesIn(out.elements) : void 0);
+      highlighted = await drawIndexOverlay(page, selectorMap, indicesIn(out.elements));
     }
     if (page) try {
       const buf = await page.screenshot({ type: "jpeg", quality: opts.jpegQuality ?? 50, scale: "css", timeout: 15e3 });
@@ -55625,7 +55650,9 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
       }
       const gone = isGone(r2);
       const error = r2.error || (gone ? `${String(r2.extractedContent)} It is not on the page any more (the page redrew or moved on) \u2014 look again before choosing.` : void 0);
-      const message = error ? void 0 : ([r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n") || void 0) && `${[r2.extractedContent, r2.longTermMemory].filter(Boolean).join("\n")}${retargetNote}`;
+      const parts = [r2.extractedContent, r2.longTermMemory].filter(Boolean).map(String);
+      const unique = parts.filter((x2, i3) => !parts.slice(0, i3).some((prev) => prev === x2 || prev.includes(x2)));
+      const message = error ? void 0 : unique.length > 0 ? `${unique.join("\n")}${retargetNote}` : void 0;
       results.push({ action, ok: !error, message, error });
       if (error) {
         interrupted = notRun(i2).trim() || void 0;

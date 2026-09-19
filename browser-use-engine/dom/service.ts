@@ -2513,20 +2513,42 @@ export class DOMService {
 	 */
 	/** Last plain-text line emitted by formatDOMForLLM (dedupes a label repeated by nested wrappers). */
 	private lastEmittedText = '';
+	/** Per formatting pass: does this node have a listed interactive descendant? */
+	private shownBelow: WeakMap<DOMTreeNode, boolean> = new WeakMap();
+
+	private hasListedInteractiveBelow(node: DOMTreeNode, selectorMap?: Map<number, EnhancedDOMTreeNode>): boolean {
+		const cached = this.shownBelow.get(node);
+		if (cached !== undefined) return cached;
+		let found = false;
+		for (const child of node.children || []) {
+			if ((child.isInteractive && (!selectorMap || selectorMap.has(child.index))) || this.hasListedInteractiveBelow(child, selectorMap)) {
+				found = true;
+				break;
+			}
+		}
+		this.shownBelow.set(node, found);
+		return found;
+	}
 
 	formatDOMForLLM(
 		domTree: DOMTreeNode[],
 		indent: number = 0,
 		showNewElements: boolean = true,
-		selectorMap?: Map<number, EnhancedDOMTreeNode>
+		selectorMap?: Map<number, EnhancedDOMTreeNode>,
+		/** An interactive ancestor was already printed (the model clicks that). */
+		underShown: boolean = false
 	): string {
 		let output = '';
-		if (indent === 0) this.lastEmittedText = '';
+		if (indent === 0) {
+			this.lastEmittedText = '';
+			this.shownBelow = new WeakMap();
+		}
 
 		for (const node of domTree) {
 			// Only show interactive elements that exist in the filtered selectorMap
 			// This fixes the index mismatch bug where LLM would see indices that were filtered out
 			const isInSelectorMap = !selectorMap || selectorMap.has(node.index);
+			let printedSelf = node.isInteractive && isInSelectorMap;
 			if (node.isInteractive && isInSelectorMap) {
 				const prefix = '\t'.repeat(indent);
 				const newMarker = showNewElements && node.isNew ? '*' : '';
@@ -2638,7 +2660,18 @@ export class DOMService {
 					const opts = this.extractSelectOptions(node.children);
 					if (opts.length > 0) options = ` [options: ${opts.join(', ')}]`;
 				}
-				if (t.length > 1) output += `${prefix}${index}${tag}${attrs}>${t}</${node.tagName.toLowerCase()}>${options}\n`;
+				// An entry with no text, no attributes and no options says nothing the
+				// model can use. Inside a listed control (a link's icon span, a
+				// picture's <source>s) or as a mere wrapper of listed controls it is
+				// pure noise — DoorDash home: 135 of 235 lines. Not printed (still
+				// clickable by index); a standalone empty control (an icon-only ✕)
+				// is kept.
+				const tagLower = node.tagName.toLowerCase();
+				const empty = t.length <= 1 && attrs === '' && options === '';
+				const noise = tagLower === 'source' || tagLower === 'track' || (empty && (underShown || this.hasListedInteractiveBelow(node, selectorMap)));
+				if (noise) {
+					printedSelf = false;
+				} else if (t.length > 1) output += `${prefix}${index}${tag}${attrs}>${t}</${tagLower}>${options}\n`;
 				else output += `${prefix}${index}${tag}${attrs} />${options}\n`;
 
 				// Iframes: hint at content hidden below the iframe viewport (port of the upstream scroll hints)
@@ -2663,13 +2696,13 @@ export class DOMService {
 			if (node.children.length > 0) {
 				// Don't recurse into select children as we've already shown options
 				if (node.tagName.toLowerCase() !== 'select') {
-					// Only increase indent if this node was actually shown (interactive AND in selectorMap)
-					const wasShown = node.isInteractive && isInSelectorMap;
+					// Only increase indent if this node's line was actually printed
 					output += this.formatDOMForLLM(
 						node.children,
-						indent + (wasShown ? 1 : 0),
+						indent + (printedSelf ? 1 : 0),
 						showNewElements,
-						selectorMap
+						selectorMap,
+						underShown || printedSelf
 					);
 				}
 			}
