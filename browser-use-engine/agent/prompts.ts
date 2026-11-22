@@ -531,6 +531,11 @@ export class AgentMessagePrompt {
 			}
 			closedPopupsText += '\n';
 		}
+		// Tabs the site opened or closed by itself since the last step (sign-in popup, target=_blank)
+		const tabNotes = (this.browserState as any).tabNotes as string[] | undefined;
+		if (tabNotes && tabNotes.length > 0) {
+			closedPopupsText += `Tab changes:\n${tabNotes.map((note) => `  - ${note}`).join('\n')}\n\n`;
+		}
 
 		return `${statsText}${currentTabText}
 Available tabs:

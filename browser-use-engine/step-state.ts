@@ -139,6 +139,10 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		if (Array.isArray(state.closedPopupMessages) && state.closedPopupMessages.length > 0) {
 			for (const raw of state.closedPopupMessages) out.notes.push(describeDialog(String(raw)));
 		}
+		// A tab the site opened or closed by itself (sign-in popup, target=_blank).
+		if (Array.isArray(state.tabNotes)) {
+			for (const note of state.tabNotes) out.notes.push(String(note));
+		}
 		if (state.stateError) out.notes.push(String(state.stateError));
 		// Files the browser saved since the last look: the model needs the path
 		// (to read it, attach it, or hand it to the user).

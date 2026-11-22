@@ -130,6 +130,8 @@ export interface BrowserStateSummary {
 	paginationButtons: PaginationButton[]; // Detected pagination buttons
 	/** Messages from auto-closed JavaScript dialogs since the last state */
 	closedPopupMessages?: string[];
+	/** Tabs that opened or closed on their own since the last state (a sign-in popup, a target=_blank link). */
+	tabNotes?: string[];
 	/** Dialog / cookie banner / overlay candidates covering the page (from the DOM service). */
 	modalOverlays?: Array<{ backendNodeId: number; nodeName: string; reason: string }>;
 	/** Safe, model-visible explanation when the current state could not be captured */
@@ -151,6 +153,7 @@ export const BrowserStateSummarySchema = z.object({
 	pendingNetworkRequests: z.array(NetworkRequestSchema).default([]),
 	paginationButtons: z.array(PaginationButtonSchema).default([]),
 	closedPopupMessages: z.array(z.string()).default([]),
+	tabNotes: z.array(z.string()).default([]),
 	stateError: z.string().nullable().optional(),
 });
 

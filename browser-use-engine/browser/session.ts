@@ -104,6 +104,20 @@ export class BrowserSession {
 	private currentPageId?: string;
 	private started: boolean = false;
 
+	// Every tab in the browser is a tab of this session, whoever opened it: the
+	// agent (navigate new_tab), the site (window.open, target=_blank — every
+	// "Sign in with …" popup) or the person on takeover. Python learns of them
+	// from CDP Target.attachedToTarget (SessionManager); here the context's
+	// 'page' event feeds the same single registry (`pages`).
+	/** Page → its id in `pages`. */
+	private pageIds: WeakMap<Page, string> = new WeakMap();
+	/** Tab id → the tab that opened it, so focus returns there when the popup closes itself. */
+	private pageOpeners: Map<string, string> = new Map();
+	/** Our own context.newPage() calls in flight: their 'page' event is not a tab to adopt. */
+	private ownPageCreations = 0;
+	/** Tabs that opened or closed on their own since the last browser state. */
+	private tabEvents: Array<{ type: 'opened' | 'closed'; pageId: string; url?: string; followed?: boolean; backOn?: string }> = [];
+
 	// Cached selector map for element lookup by index (session-wide for single agent)
 	private cachedSelectorMap: Map<number, EnhancedDOMTreeNode> = new Map();
 	private cachedBrowserStateSummary: BrowserStateSummary | null = null;
@@ -213,6 +227,29 @@ export class BrowserSession {
 
 		this.eventBus.on(BrowserEventNames.SELECT_DROPDOWN_OPTION, async (payload: any) => {
 			await this.handleSelectDropdownOption(payload);
+		});
+
+		// Tabs. Nothing answered these two, so `switch` and `close` waited out
+		// their 10 s timeout and failed on every call.
+		this.eventBus.on(BrowserEventNames.SWITCH_TAB, async (payload: any) => {
+			try {
+				// Python: a null target means the most recently opened tab.
+				const targetId = payload?.targetId ?? Array.from(this.pages.keys()).pop();
+				if (!targetId) throw new Error('No tab to switch to');
+				await this.switchTab(String(targetId));
+				this.eventBus.respondToEvent(payload._eventId, null);
+			} catch (error: any) {
+				this.eventBus.rejectEvent(payload._eventId, error);
+			}
+		});
+		this.eventBus.on(BrowserEventNames.CLOSE_TAB, async (payload: any) => {
+			try {
+				const closed = await this.closeTab(String(payload?.targetId ?? ''));
+				if (!closed) throw new Error('The tab could not be closed (it may already be gone)');
+				this.eventBus.respondToEvent(payload._eventId, null);
+			} catch (error: any) {
+				this.eventBus.rejectEvent(payload._eventId, error);
+			}
 		});
 	}
 
@@ -342,21 +379,24 @@ export class BrowserSession {
 		// Any further blank tabs the profile restored are closed; real restored
 		// pages are left alone.
 		const preOpened = this.context.pages();
-		const page = preOpened.find(p => this.isNewTabPage(p.url())) ?? (await this.context.newPage());
+		const reused = preOpened.find(p => this.isNewTabPage(p.url()));
 		for (const extra of preOpened) {
-			if (extra !== page && this.isNewTabPage(extra.url())) {
+			if (extra !== reused && this.isNewTabPage(extra.url())) {
 				await extra.close().catch(() => undefined);
 			}
 		}
-		const pageId = this.generatePageId();
-		this.pages.set(pageId, page);
-		this.currentPageId = pageId;
+		if (reused) {
+			this.currentPageId = this.registerPage(reused);
+			// Inject stealth scripts to avoid bot detection
+			await this.injectStealthScripts(reused);
+		} else {
+			this.currentPageId = (await this.openOwnPage()).pageId;
+		}
 
-		// Inject stealth scripts to avoid bot detection
-		await this.injectStealthScripts(page);
-
-		// Set up page event listeners
-		this.setupPageListeners(page, pageId);
+		// Pages the profile restored are tabs too, and so is every page opened
+		// from here on that this session did not open itself.
+		this.syncPages(false);
+		this.context.on('page', (opened) => this.onContextPage(opened));
 
 		// Listen for context close (user closes browser window, etc.)
 		// Try to save storage state before connection is fully lost
@@ -426,6 +466,9 @@ export class BrowserSession {
 		}
 
 		this.pages.clear();
+		this.pageOpeners.clear();
+		this.tabEvents = [];
+		this.currentPageId = undefined;
 		this.started = false;
 	}
 
@@ -723,7 +766,7 @@ export class BrowserSession {
 		if (remainingPages.length > 0) {
 			const [pageId, page] = remainingPages[remainingPages.length - 1]; // Get last page
 			console.warn(`🔄 Current page closed, switching to fallback page ${pageId}`);
-			this.currentPageId = pageId;
+			this.focusPage(pageId);
 			return page;
 		}
 
@@ -742,12 +785,8 @@ export class BrowserSession {
 			// No page exists - try to create one if context is available
 			if (this.context) {
 				console.warn('🔄 No active page, creating new one...');
-				const newPage = await this.context.newPage();
-				const newPageId = this.generatePageId();
-				this.pages.set(newPageId, newPage);
-				this.currentPageId = newPageId;
-				await this.injectStealthScripts(newPage);
-				this.setupPageListeners(newPage, newPageId);
+				const { pageId: newPageId, page: newPage } = await this.openOwnPage();
+				this.focusPage(newPageId);
 				return newPage;
 			}
 			throw new Error('No active page and no browser context available');
@@ -787,11 +826,7 @@ export class BrowserSession {
 			throw new Error('Browser context not available - call start() first');
 		}
 
-		const newPage = await this.context.newPage();
-		const pageId = agentId ? `agent_${agentId}_${Date.now()}` : this.generatePageId();
-		this.pages.set(pageId, newPage);
-		await this.injectStealthScripts(newPage);
-		this.setupPageListeners(newPage, pageId);
+		const { pageId, page: newPage } = await this.openOwnPage(agentId ? `agent_${agentId}_${Date.now()}` : undefined);
 
 		console.log(`🆕 [BrowserSession] Created new tab ${pageId} for agent${agentId ? ` ${agentId}` : ''}`);
 		console.log(`📊 [BrowserSession] Total tabs: ${this.pages.size}`);
@@ -1074,7 +1109,7 @@ export class BrowserSession {
 	 */
 	switchToPage(pageId: string): boolean {
 		if (this.pages.has(pageId)) {
-			this.currentPageId = pageId;
+			this.focusPage(pageId);
 			console.log(`🔄 [BrowserSession] Switched to tab ${pageId}`);
 			return true;
 		}
@@ -1118,26 +1153,184 @@ export class BrowserSession {
 	}
 
 	/**
+	 * Put a page in the tab registry (idempotent) and wire its listeners.
+	 * The ONLY place a page becomes a tab.
+	 */
+	private registerPage(page: Page, pageId: string = this.generatePageId()): string {
+		const known = this.pageIds.get(page);
+		if (known && this.pages.get(known) === page) return known;
+		this.pages.set(pageId, page);
+		this.pageIds.set(page, pageId);
+		this.setupPageListeners(page, pageId);
+		return pageId;
+	}
+
+	/** Open a tab of our own (never focuses it: the caller decides). */
+	private async openOwnPage(pageId?: string): Promise<{ pageId: string; page: Page }> {
+		if (!this.context) {
+			throw new Error('Browser context not available - call start() first');
+		}
+		this.ownPageCreations++;
+		let page: Page;
+		try {
+			page = await this.context.newPage();
+		} finally {
+			this.ownPageCreations--;
+		}
+		const id = this.registerPage(page, pageId);
+		await this.injectStealthScripts(page);
+		return { pageId: id, page };
+	}
+
+	/**
+	 * The context opened a page. Ours (openOwnPage) are registered by their
+	 * creator under the id it chose; anything else is a popup or a tab the
+	 * person opened, and is adopted here.
+	 */
+	private onContextPage(page: Page): void {
+		const ours = this.ownPageCreations > 0;
+		void (async () => {
+			const opener = await page.opener().catch(() => null);
+			if (this.pageIds.has(page) || page.isClosed()) return;
+			// Our own tabs have no opener. A popup that lands while one of ours is
+			// being created does, so it is still adopted.
+			if (ours && !opener) return;
+			this.adoptPage(page, opener ? this.pageIds.get(opener) : undefined, true);
+		})();
+	}
+
+	/**
+	 * A tab this session did not open. When the page the agent is on opened it
+	 * (a click on "Sign in with …", a target=_blank link) the agent follows it,
+	 * as the person's own browser would; any other new tab is only announced.
+	 */
+	private adoptPage(page: Page, openerId: string | undefined, announce: boolean): string {
+		const pageId = this.registerPage(page);
+		// Applies from the popup's next document on; its first one is already loading.
+		void this.injectStealthScripts(page);
+		if (openerId && this.pages.has(openerId)) {
+			this.pageOpeners.set(pageId, openerId);
+		}
+		const followed = !!openerId && openerId === this.currentPageId;
+		if (followed) this.focusPage(pageId);
+		if (announce) this.tabEvents.push({ type: 'opened', pageId, followed });
+		console.log(`🆕 [BrowserSession] Adopted tab ${pageId}${openerId ? ` opened by ${openerId}` : ''}${followed ? ' (now current)' : ''}`);
+		return pageId;
+	}
+
+	/**
+	 * Safety net for a missed 'page' event: anything the context has open that
+	 * is not a tab yet becomes one. Cheap (no round trip), so every tab listing
+	 * runs it.
+	 */
+	private syncPages(announce: boolean = true): void {
+		if (!this.context || this.ownPageCreations > 0) return;
+		let open: Page[] = [];
+		try {
+			open = this.context.pages();
+		} catch {
+			return;
+		}
+		for (const page of open) {
+			if (!this.pageIds.has(page) && !page.isClosed()) this.adoptPage(page, undefined, announce);
+		}
+	}
+
+	/**
+	 * Make a tab the current one. The ONLY place focus moves: the single-agent
+	 * CDP session and element indices belong to the previous page, and the
+	 * person watching (live view, desktop window) should see what the agent sees.
+	 */
+	private focusPage(pageId: string): void {
+		const page = this.pages.get(pageId);
+		if (!page) throw new Error(`No tab with id ${pageId}`);
+		if (this.currentPageId === pageId) return;
+		this.currentPageId = pageId;
+		const stale = this.cdpSession;
+		this.cdpSession = null;
+		if (stale) stale.detach().catch(() => {});
+		this.cachedSelectorMap.clear();
+		page.bringToFront().catch(() => {});
+	}
+
+	/**
+	 * Drop a tab from the registry. If it was the current one, focus returns to
+	 * the tab that opened it (the page waiting on that sign-in popup), else to
+	 * the most recent tab left.
+	 */
+	private forgetPage(pageId: string): void {
+		const page = this.pages.get(pageId);
+		if (!page) return;
+		this.pages.delete(pageId);
+		this.pageIds.delete(page);
+		// Clean up per-page selector map and CDP session (multi-agent support)
+		this.pageSelectorMaps.delete(pageId);
+		const cdpSession = this.pageCdpSessions.get(pageId);
+		if (cdpSession) {
+			cdpSession.detach().catch(() => {}); // Ignore detach errors
+			this.pageCdpSessions.delete(pageId);
+		}
+		const openerId = this.pageOpeners.get(pageId);
+		this.pageOpeners.delete(pageId);
+		if (this.currentPageId === pageId) {
+			this.currentPageId = undefined;
+			// The single-agent CDP session belonged to the closed page
+			this.cdpSession = null;
+			this.cachedSelectorMap.clear();
+			const next = openerId && this.pages.has(openerId) ? openerId : Array.from(this.pages.keys()).pop();
+			if (next) this.focusPage(next);
+		}
+	}
+
+	/** What happened to tabs on their own since the last look, in words for the model. */
+	private drainTabNotes(): string[] {
+		const events = this.tabEvents;
+		this.tabEvents = [];
+		const short = (id: string) => id.slice(-4);
+		const notes: string[] = [];
+		for (const event of events) {
+			if (event.type === 'opened') {
+				const page = this.pages.get(event.pageId);
+				if (!page) continue; // opened and closed again before anyone looked: the close says it
+				let url = '';
+				try {
+					url = page.url();
+				} catch {
+					// ignore
+				}
+				const where = url && !this.isNewTabPage(url) ? ` (${url.slice(0, 120)})` : '';
+				if (event.pageId === this.currentPageId) {
+					notes.push(`The page opened a new tab [${short(event.pageId)}]${where}; you are on it now.`);
+				} else {
+					notes.push(`A new tab [${short(event.pageId)}]${where} opened in the background; switch to it if you need it.`);
+				}
+			} else {
+				const where = event.url && !this.isNewTabPage(event.url) ? ` (${event.url.slice(0, 120)})` : '';
+				const back = event.backOn && this.pages.has(event.backOn) ? ` You are back on tab [${short(event.backOn)}].` : '';
+				notes.push(`Tab [${short(event.pageId)}]${where} closed on its own.${back}`);
+			}
+		}
+		return notes;
+	}
+
+	/**
 	 * Set up page event listeners
 	 */
 	private setupPageListeners(page: Page, pageId: string) {
 		page.on('close', () => {
-			this.pages.delete(pageId);
-			// Clean up per-page selector map (multi-agent support)
-			this.pageSelectorMaps.delete(pageId);
-			// Clean up per-page CDP session (multi-agent support)
-			const cdpSession = this.pageCdpSessions.get(pageId);
-			if (cdpSession) {
-				cdpSession.detach().catch(() => {}); // Ignore detach errors
-				this.pageCdpSessions.delete(pageId);
+			// Only a tab the session still knows closed on its own (the site's
+			// window.close() after a sign-in, or the person): closeTab() forgets
+			// its tab before closing it, so the agent is not told what it just did.
+			if (this.pages.get(pageId) !== page) return;
+			let url = '';
+			try {
+				url = page.url();
+			} catch {
+				// a closed page may not answer
 			}
-			if (this.currentPageId === pageId) {
-				// Switch to another page if available
-				const remainingPages = Array.from(this.pages.keys());
-				this.currentPageId = remainingPages[0];
-				// Clear single-agent CDP session since current page changed
-				this.cdpSession = null;
-			}
+			const wasCurrent = this.currentPageId === pageId;
+			this.forgetPage(pageId);
+			this.tabEvents.push({ type: 'closed', pageId, url, backOn: wasCurrent ? this.currentPageId : undefined });
 			console.log(`🗑️ [BrowserSession] Page ${pageId} closed, cleaned up resources`);
 		});
 
@@ -1363,7 +1556,7 @@ export class BrowserSession {
 					const existingTab = this.findTabByUrl(event.url);
 					if (existingTab && existingTab !== this.currentPageId) {
 						console.debug(`URL already open in tab ${existingTab}, switching to it`);
-						this.currentPageId = existingTab;
+						this.focusPage(existingTab);
 						page = await this.ensurePage();
 						this.eventBus.respondToEvent(event._eventId, null);
 						return;
@@ -1432,7 +1625,7 @@ export class BrowserSession {
 		for (const [pageId, page] of this.pages.entries()) {
 			if (pageId !== this.currentPageId && this.isNewTabPage(page.url())) {
 				console.debug(`Found existing about:blank tab ${pageId}, reusing it`);
-				this.currentPageId = pageId;
+				this.focusPage(pageId);
 				return page;
 			}
 		}
@@ -1440,12 +1633,8 @@ export class BrowserSession {
 		// No reusable tab found, create a new one
 		if (this.context) {
 			try {
-				const newPage = await this.context.newPage();
-				const newPageId = this.generatePageId();
-				this.pages.set(newPageId, newPage);
-				this.currentPageId = newPageId;
-				await this.injectStealthScripts(newPage);
-				this.setupPageListeners(newPage, newPageId);
+				const { pageId: newPageId, page: newPage } = await this.openOwnPage();
+				this.focusPage(newPageId);
 				console.debug(`Created new tab ${newPageId}`);
 				return newPage;
 			} catch (error) {
@@ -2798,6 +2987,7 @@ export class BrowserSession {
 				paginationButtons: [],
 				modalOverlays: lastPageState?.modalOverlays,
 				closedPopupMessages: this.drainClosedPopupMessages(),
+				tabNotes: this.drainTabNotes(),
 			};
 
 			// Capture screenshot with element highlighting (like Python)
@@ -2890,6 +3080,7 @@ export class BrowserSession {
 			pendingNetworkRequests: [],
 			paginationButtons: [],
 			closedPopupMessages: this.drainClosedPopupMessages(),
+			tabNotes: this.drainTabNotes(),
 			stateError: `Browser state could not be captured: ${message}. The page may still be loading or unresponsive — consider waiting or refreshing.`,
 		};
 	}
@@ -3396,13 +3587,22 @@ export class BrowserSession {
 	// ============================================================================
 
 	private async getAllTabs(): Promise<TabInfo[]> {
+		this.syncPages();
 		const tabs: TabInfo[] = [];
 
-		for (const [pageId, page] of this.pages.entries()) {
+		for (const [pageId, page] of Array.from(this.pages.entries())) {
+			if (page.isClosed()) continue;
+			// A popup is often mid-navigation (or already closing) when it is
+			// listed: its title must never cost the whole browser state.
+			const title = await Promise.race([
+				page.title().catch(() => ''),
+				new Promise<string>((resolve) => setTimeout(() => resolve(''), 1500)),
+			]);
 			tabs.push({
 				targetId: pageId,
 				url: page.url(),
-				title: await page.title(),
+				title,
+				parentTargetId: this.pageOpeners.get(pageId) ?? null,
 			});
 		}
 
@@ -3617,7 +3817,7 @@ export class BrowserSession {
 		// If it's a short ID (4 chars), look up the full target ID
 		const targetId =
 			tabId.length === 4 ? await this.getTargetIdFromTabId(tabId) : tabId;
-		this.currentPageId = targetId;
+		this.focusPage(targetId);
 	}
 
 	/**
@@ -3631,25 +3831,10 @@ export class BrowserSession {
 		const page = this.pages.get(targetId);
 		if (page) {
 			try {
+				// Forget first: this close is the agent's own, not news for it
+				// (a page that fails to close is picked up again by syncPages).
+				this.forgetPage(targetId);
 				await page.close();
-				this.pages.delete(targetId);
-
-				// Clean up per-page selector map (multi-agent support)
-				this.pageSelectorMaps.delete(targetId);
-
-				// Clean up per-page CDP session (multi-agent support)
-				const cdpSession = this.pageCdpSessions.get(targetId);
-				if (cdpSession) {
-					cdpSession.detach().catch(() => {}); // Ignore detach errors
-					this.pageCdpSessions.delete(targetId);
-				}
-
-				// If we closed the current page, switch to another
-				if (this.currentPageId === targetId) {
-					const remainingPages = Array.from(this.pages.keys());
-					this.currentPageId = remainingPages.length > 0 ? remainingPages[0] : undefined;
-					console.log(`🔄 [BrowserSession] Switched to another tab after closing current`);
-				}
 
 				console.log(`🗑️ [BrowserSession] Closed tab ${tabId}. Remaining tabs: ${this.pages.size}`);
 				return true;
@@ -4529,12 +4714,8 @@ export class BrowserSession {
 			throw new Error('Browser context not initialized');
 		}
 
-		const page = await this.context.newPage();
-		const pageId = this.generatePageId();
-		this.pages.set(pageId, page);
-		await this.injectStealthScripts(page);
-		this.setupPageListeners(page, pageId);
-		this.currentPageId = pageId;
+		const { pageId, page } = await this.openOwnPage();
+		this.focusPage(pageId);
 
 		if (url) {
 			await page.goto(url);
@@ -4592,14 +4773,8 @@ export class BrowserSession {
 		}
 
 		if (page && pageId) {
+			this.forgetPage(pageId);
 			await page.close();
-			this.pages.delete(pageId);
-
-			// Switch to another page if this was the current one
-			if (this.currentPageId === pageId) {
-				const remainingPages = Array.from(this.pages.keys());
-				this.currentPageId = remainingPages[0];
-			}
 		}
 	}
 
@@ -4789,8 +4964,8 @@ export class BrowserSession {
 		for (let i = 1; i < pageIds.length; i++) {
 			const page = this.pages.get(pageIds[i]);
 			if (page) {
+				this.forgetPage(pageIds[i]);
 				await page.close();
-				this.pages.delete(pageIds[i]);
 			}
 		}
 
