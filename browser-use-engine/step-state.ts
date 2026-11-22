@@ -130,9 +130,15 @@ export async function captureStepState(session: BrowserSession, opts: CaptureOpt
 		if (elements.length > maxChars) {
 			// Cut on a line so no `[index]` is half there, and remember which
 			// indices survived: the screenshot must not number boxes the text lacks.
-			const nl = elements.lastIndexOf('\n', maxChars);
-			const keep = nl > maxChars / 2 ? nl : maxChars;
-			elements = `${elements.slice(0, keep)}\n… (${elements.length - keep} more chars not shown; scroll or narrow the page)`;
+			// Keep the top and the last fifth: what closes a long form or dialog
+			// (Submit / Done / Place order) is usually its last line (upstream 1.0 `state`).
+			const headBudget = Math.floor(maxChars * 0.8);
+			const nl = elements.lastIndexOf('\n', headBudget);
+			const keep = nl > headBudget / 2 ? nl : headBudget;
+			const tailFrom = elements.indexOf('\n', elements.length - (maxChars - headBudget));
+			const tail = tailFrom > keep ? elements.slice(tailFrom + 1) : '';
+			const cut = elements.length - keep - tail.length;
+			elements = `${elements.slice(0, keep)}\n… (${cut} chars not shown here; scroll or narrow the page)${tail ? `\n${tail}` : ''}`;
 			out.elementsTruncated = true;
 		}
 		out.elements = elements;
@@ -515,6 +521,9 @@ export async function runStepActions(
 	const results: StepActionResult[] = [];
 	let interrupted: string | undefined;
 	const urlBefore = await session.getCurrentPageUrl().catch(() => '');
+	// What the page looked like just before each action that should move it
+	// (index into `results`), read again once the page has settled after it.
+	const watched: Array<{ result: number; before: ChangeProbe; tabs: number }> = [];
 	const planned = Math.min(actions.length, max);
 	const notRun = (i: number) => (i < planned - 1 ? ` The remaining ${planned - i - 1} action(s) were not run.` : '');
 	for (let i = 0; i < planned; i++) {
@@ -531,7 +540,10 @@ export async function runStepActions(
 			const isGone = (r: any) =>
 				(!r?.error && typeof r?.extractedContent === 'string' && /^Element index \d+ not available/.test(r.extractedContent)) ||
 				(typeof r?.error === 'string' && /^Element (?:index |with index )?\d+ not (?:available|found)/i.test(r.error));
+			const before = MOVING_ACTIONS.has(action) ? await probeChange(session) : null;
+			const tabsBefore = before ? tabCount(session) : 0;
 			let r = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+			if (before) watched.push({ result: results.length, before, tabs: tabsBefore });
 			// The engine answers a vanished index with a message and NO error
 			// ("Element index 12 not available - page may have changed"). The page
 			// usually just redrew: find the same control again and try once more.
@@ -598,6 +610,24 @@ export async function runStepActions(
 		const ran = results.filter(r => r.ok).map(r => r.action);
 		const light = ran.every(a => LIGHT_ACTIONS.has(a)) && !ran.some((a, i) => a === 'send_keys' && /enter|return/i.test(String(results[i]?.message || '')));
 		await settleAfterActions(session, light ? { light: true, scrolled: ran.includes('scroll') } : undefined);
+		// A click or key press after which the page is exactly as it was: say so
+		// on that action (upstream 1.0 prints "no change"), instead of leaving the
+		// model to find out by comparing two element lists.
+		const last = watched[watched.length - 1];
+		if (last && last.result === results.length - 1 && results[last.result]?.ok) {
+			const same = (p: ChangeProbe | null) => !!p && p.doc === last.before.doc && p.url === last.before.url && p.n === last.before.n && tabCount(session) === last.tabs;
+			let unchanged = same(await probeChange(session));
+			if (unchanged) {
+				// Only a dead click pays this: a sign-in popup or a fetched panel often
+				// shows up a few hundred ms after the click that asked for it.
+				await new Promise(resolve => setTimeout(resolve, 350));
+				unchanged = same(await probeChange(session));
+			}
+			if (unchanged) {
+				const note = 'Nothing on the page changed after this (no navigation, no new or removed content, no field edited).';
+				results[last.result].message = results[last.result].message ? `${results[last.result].message}\n${note}` : note;
+			}
+		}
 	}
 	return { ok: results.length > 0 && results.every(r => r.ok), results, interrupted };
 }
@@ -670,13 +700,16 @@ export async function settleAfterActions(session: BrowserSession, opts: { light?
 	try {
 		const page: any = session.getPageOrCurrent();
 		if (opts.light) {
-			// Enough for a suggestion dropdown or a re-rendered list to appear; a
+			// Enough for a suggestion dropdown or a re-rendered list to appear (a
+			// debounced autocomplete shows nothing for its first ~200 ms); a
 			// scroll gets a little longer for lazy-loaded rows.
+			if (await settleQuiet(session, { minMs: 250, quietMs: 100, capMs: opts.scrolled ? 1500 : 900 })) return;
 			await new Promise(resolve => setTimeout(resolve, 250));
 			await waitUntilStable(page, { maxMs: opts.scrolled ? 1500 : 900, intervalMs: 300 });
 			return;
 		}
 		await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => undefined);
+		if (await settleQuiet(session, { minMs: 0, quietMs: 150, capMs: 4000 })) return;
 		const idle = (session as any).waitForNetworkIdle;
 		// The engine's helper counts in SECONDS.
 		if (typeof idle === 'function') await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => undefined);
@@ -684,6 +717,125 @@ export async function settleAfterActions(session: BrowserSession, opts: { light?
 	} catch {
 		/* best effort */
 	}
+}
+
+/** Actions that are expected to move the page: after one of these, "nothing
+ *  changed" is worth saying. Typing always edits a field; scrolling and reading do not count. */
+const MOVING_ACTIONS = new Set(['click', 'send_keys']);
+
+/** Elements this engine draws into the page itself. */
+const OWN_OVERLAYS = `#${OVERLAY_ID},[data-browser-use-interaction-highlight],[data-browser-use-highlight]`;
+
+/**
+ * The page's own account of itself (upstream 1.0 PROBE_JS): one
+ * MutationObserver per document, installed on the first call, counts real DOM
+ * changes and form edits and remembers when the last one happened. Same-origin
+ * frames at any depth count as the page. Left out as noise: an attribute
+ * written with the value it already had (Google Flights rewrites a class every
+ * frame), and repeated style writes on one element (an animation loop).
+ */
+const CHANGE_PROBE = `(() => {
+	const w = window;
+	const watch = (win, counted) => {
+		const doc = win.document;
+		if (doc.__zbWatched) return;
+		doc.__zbWatched = true;
+		if (counted) { w.__zbLast = performance.now(); w.__zbN++; }
+		const styled = new WeakMap();
+		new MutationObserver((records) => {
+			const now = performance.now();
+			let real = false;
+			for (const r of records) {
+				// Our own drawings (index boxes, the click highlight) are not the page reacting.
+				const own = (n) => { const e = n && (n.nodeType === 1 ? n : n.parentElement); return !!(e && e.closest && e.closest(${JSON.stringify(OWN_OVERLAYS)})); };
+				if (own(r.target) || Array.from(r.addedNodes).concat(Array.from(r.removedNodes)).some(own)) continue;
+				if (r.attributeName && r.oldValue === r.target.getAttributeNS(r.attributeNamespace, r.attributeName)) continue;
+				if (r.attributeName !== 'style') real = true;
+				else if (now - (styled.get(r.target) ?? -1e9) > 200) real = true;
+				if (r.attributeName === 'style') styled.set(r.target, now);
+			}
+			if (real) { w.__zbLast = now; w.__zbN++; }
+		}).observe(doc, { subtree: true, childList: true, attributes: true, attributeOldValue: true, characterData: true });
+		for (const type of ['input', 'change']) win.addEventListener(type, () => { w.__zbN++; }, true);
+	};
+	const first = !w.__zbObs;
+	if (first) {
+		w.__zbObs = true;
+		w.__zbLast = performance.now();
+		w.__zbN = 0;
+		w.__zbDoc = Math.random();
+		watch(w, false);
+	}
+	const frames = (win) => {
+		for (let i = 0; i < win.frames.length; i++) {
+			let f;
+			try { f = win.frames[i]; if (!f.document) continue; } catch { continue; }
+			watch(f, !first);
+			frames(f);
+		}
+	};
+	frames(w);
+	return { idle: performance.now() - w.__zbLast, ready: document.readyState, url: location.href, n: w.__zbN, doc: w.__zbDoc };
+})()`;
+
+interface ChangeProbe { idle: number; ready: string; url: string; n: number; doc: number }
+
+/** Read (and on first use install) the page's change counter. null when the
+ *  page cannot answer: mid-navigation, a crashed tab, a test double. */
+async function probeChange(session: BrowserSession): Promise<ChangeProbe | null> {
+	try {
+		const page: any = session.getPageOrCurrent();
+		const p: any = await page.evaluate(CHANGE_PROBE);
+		return p && typeof p === 'object' && typeof p.idle === 'number' && typeof p.n === 'number' ? (p as ChangeProbe) : null;
+	} catch {
+		return null;
+	}
+}
+
+function tabCount(session: BrowserSession): number {
+	try {
+		return (session as any).getAllTabIds?.().length ?? 0;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Wait for the page to go quiet, by its own events instead of a fixed sleep
+ * (upstream 1.0 `settle`): the document is parsed, no request that started in
+ * the last 1.5 s is still in flight, and nothing in the DOM changed for
+ * `quietMs`. A page still loading gets the navigation budget. Returns false
+ * when the page cannot be watched, so the caller falls back to polling.
+ */
+async function settleQuiet(session: BrowserSession, opts: { minMs: number; quietMs: number; capMs: number }): Promise<boolean> {
+	const started = Date.now();
+	let limit = opts.capMs;
+	let seen = false;
+	while (Date.now() - started < limit) {
+		const probe = await probeChange(session);
+		if (!probe) {
+			// Never answered: not a page we can watch. Answered before: a navigation is replacing the document.
+			if (!seen && Date.now() - started > 400) return false;
+			await new Promise(resolve => setTimeout(resolve, 40));
+			continue;
+		}
+		seen = true;
+		const elapsed = Date.now() - started;
+		if (probe.ready === 'loading') limit = Math.max(opts.capMs, 3000);
+		// Quiet has to be observed since this wait began, not carried over from before the action.
+		const idle = Math.min(probe.idle, elapsed);
+		let busy = false;
+		try {
+			const net = (session as any).networkActivity?.();
+			if (net) busy = net.fresh > 0 || (net.lastAt > 0 && Date.now() - net.lastAt < opts.quietMs);
+		} catch {
+			/* no network view: the DOM decides */
+		}
+		if (probe.ready !== 'loading' && idle >= opts.quietMs && !busy && elapsed >= opts.minMs) return true;
+		const wait = probe.ready === 'loading' || busy ? 40 : Math.max(20, Math.min(opts.quietMs - idle, 100), opts.minMs - elapsed);
+		await new Promise(resolve => setTimeout(resolve, Math.min(wait, 250)));
+	}
+	return seen;
 }
 
 const STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n; })()`;

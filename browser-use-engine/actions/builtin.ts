@@ -180,6 +180,10 @@ async function detectNewTabOpened(context: ActionContext, tabsBefore: Set<string
 		if (!context.pageId && context.browserSession.switchToPage(newTabId)) {
 			return `. Automatically switched to new tab (tab_id: ${shortId}).`;
 		}
+		// An agent pinned to its own tab follows the popup that tab opened (the session moved it).
+		if (context.pageId && context.browserSession.resolvePageId(context.pageId) === newTabId) {
+			return `. Automatically switched to new tab (tab_id: ${shortId}).`;
+		}
 		return `. Note: This opened a new tab (tab_id: ${shortId}) - switch to it if you need to interact with the new page.`;
 	} catch {
 		return '';
@@ -425,6 +429,10 @@ async function clickByIndex(
 		}
 
 		let memory = `Clicked ${elementDesc}`;
+		// A person could not have clicked it where it was: say what was in the way.
+		if (clickMetadata && typeof clickMetadata.coveredBy === 'string' && clickMetadata.coveredBy) {
+			memory += ` (it was covered by ${clickMetadata.coveredBy}, so it was clicked by script; if nothing happened, deal with what covers it first)`;
+		}
 		memory += await detectNewTabOpened(context, tabsBefore);
 		console.info(`🖱️ ${memory}`);
 
@@ -520,11 +528,19 @@ async function typeText(params: z.infer<typeof InputTextActionSchema>, context: 
 			TIMEOUTS.TYPE_TEXT
 		);
 
+		// A password never goes into the action line: that line lands in the
+		// conversation, the logs and receipts (upstream 1.0 `type`).
+		const isPasswordField =
+			String((element as any).nodeName || '').toLowerCase() === 'input' &&
+			String((element as any).attributes?.type || '').toLowerCase() === 'password';
 		let msg: string;
 		let logMsg: string;
 		if (hasSensitiveData) {
 			msg = sensitiveKeyName ? `Typed ${sensitiveKeyName}` : 'Typed sensitive data';
 			logMsg = sensitiveKeyName ? `Typed <${sensitiveKeyName}>` : 'Typed <sensitive>';
+		} else if (isPasswordField) {
+			msg = `Typed ${params.text.length} characters into the password field (hidden)`;
+			logMsg = msg;
 		} else {
 			msg = `Typed '${params.text}'`;
 			logMsg = msg;
@@ -536,7 +552,7 @@ async function typeText(params: z.infer<typeof InputTextActionSchema>, context: 
 		if (inputMetadata && typeof inputMetadata === 'object') {
 			const { actualValue, actual_value, ...rest } = inputMetadata as Record<string, any>;
 			const actual = actualValue ?? actual_value;
-			if (!hasSensitiveData && typeof actual === 'string' && actual !== params.text) {
+			if (!hasSensitiveData && !isPasswordField && typeof actual === 'string' && actual !== params.text) {
 				msg += `\n⚠️ Note: the field's actual value '${actual}' differs from typed text '${params.text}'. The page may have reformatted or autocompleted your input.`;
 			}
 			metadata = Object.keys(rest).length > 0 ? rest : null;
@@ -681,7 +697,7 @@ async function switchTab(params: z.infer<typeof SwitchTabActionSchema>, context:
 	try {
 		await context.browserSession.eventBus.dispatch(
 			BrowserEventNames.SWITCH_TAB,
-			{ targetId },
+			{ targetId, pageId: context.pageId },
 			TIMEOUTS.SWITCH_TAB
 		);
 	} catch (error: any) {

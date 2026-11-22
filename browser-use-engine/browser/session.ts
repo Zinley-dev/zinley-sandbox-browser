@@ -93,6 +93,14 @@ export interface BrowserSessionOptions {
 	storageState?: { cookies: any[]; origins: any[] };
 }
 
+/** The target sits behind a dialog that does not contain it: nothing is clicked, by any method. */
+class CoveredByDialogError extends Error {
+	constructor(coveredBy: string) {
+		super(`Element is covered by ${coveredBy}; nothing was clicked. Deal with that first (Accept / Close / ✕ / Esc), then look at the page again.`);
+		this.name = 'CoveredByDialogError';
+	}
+}
+
 export class BrowserSession {
 	public readonly id: string;
 	public readonly eventBus: EventBus;
@@ -115,8 +123,17 @@ export class BrowserSession {
 	private pageOpeners: Map<string, string> = new Map();
 	/** Our own context.newPage() calls in flight: their 'page' event is not a tab to adopt. */
 	private ownPageCreations = 0;
-	/** Tabs that opened or closed on their own since the last browser state. */
-	private tabEvents: Array<{ type: 'opened' | 'closed'; pageId: string; url?: string; followed?: boolean; backOn?: string }> = [];
+	/** Tabs that opened or closed on their own since the last browser state. `home` names the pinned agent it concerns. */
+	private tabEvents: Array<{ type: 'opened' | 'closed'; pageId: string; url?: string; followed?: boolean; backOn?: string; home?: string }> = [];
+	/**
+	 * Agents that share this browser are pinned to a tab of their own (its id
+	 * is their `pageId`, their "home"). When that agent's page opens a popup the
+	 * agent follows it exactly as a lone agent does, without moving anyone
+	 * else: home → the tab that agent is on now. Every per-tab entry point
+	 * resolves a pageId through this map, so callers keep passing their home id.
+	 */
+	private agentHomes: Set<string> = new Set();
+	private agentFocus: Map<string, string> = new Map();
 
 	// Cached selector map for element lookup by index (session-wide for single agent)
 	private cachedSelectorMap: Map<number, EnhancedDOMTreeNode> = new Map();
@@ -128,6 +145,10 @@ export class BrowserSession {
 
 	// Network idle detection
 	private pendingRequests: Set<string> = new Set();
+	/** In-flight request → when it started and on which tab (see networkActivity). */
+	private requestStarted: Map<string, { at: number; pageId: string }> = new Map();
+	/** Tab id → when its network last moved (a request started, finished or failed). */
+	private lastNetworkAt: Map<string, number> = new Map();
 	private networkIdleConfig = {
 		enabled: true,
 		idleTime: 0.5, // Network must be idle for this duration (seconds)
@@ -168,65 +189,65 @@ export class BrowserSession {
 	private registerEventHandlers() {
 		// Navigation
 		this.eventBus.on(BrowserEventNames.NAVIGATE_TO_URL, async (payload: any) => {
-			await this.handleNavigateToUrl(payload);
+			await this.handleNavigateToUrl(this.forAgent(payload));
 		});
 
 		// Interaction
 		this.eventBus.on(BrowserEventNames.CLICK_ELEMENT, async (payload: any) => {
-			await this.handleClickElement(payload);
+			await this.handleClickElement(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.TYPE_TEXT, async (payload: any) => {
-			await this.handleTypeText(payload);
+			await this.handleTypeText(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.SCROLL, async (payload: any) => {
-			await this.handleScroll(payload);
+			await this.handleScroll(this.forAgent(payload));
 		});
 
 		// Browser state
 		this.eventBus.on(BrowserEventNames.BROWSER_STATE_REQUEST, async (payload: any) => {
-			await this.handleBrowserStateRequest(payload);
+			await this.handleBrowserStateRequest(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.SCREENSHOT, async (payload: any) => {
-			await this.handleScreenshot(payload);
+			await this.handleScreenshot(this.forAgent(payload));
 		});
 
 		// History
 		this.eventBus.on(BrowserEventNames.GO_BACK, async (payload: any) => {
-			await this.handleGoBack(payload);
+			await this.handleGoBack(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.GO_FORWARD, async (payload: any) => {
-			await this.handleGoForward(payload);
+			await this.handleGoForward(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.REFRESH, async (payload: any) => {
-			await this.handleRefresh(payload);
+			await this.handleRefresh(this.forAgent(payload));
 		});
 
 		// Utilities
 		this.eventBus.on(BrowserEventNames.WAIT, async (payload: any) => {
-			await this.handleWait(payload);
+			await this.handleWait(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.SEND_KEYS, async (payload: any) => {
-			await this.handleSendKeys(payload);
+			await this.handleSendKeys(this.forAgent(payload));
 		});
 
 		// File upload
 		this.eventBus.on(BrowserEventNames.UPLOAD_FILE, async (payload: any) => {
-			await this.handleUploadFile(payload);
+			await this.handleUploadFile(this.forAgent(payload));
 		});
 
 		// Dropdown handling
 		this.eventBus.on(BrowserEventNames.GET_DROPDOWN_OPTIONS, async (payload: any) => {
-			await this.handleGetDropdownOptions(payload);
+			await this.handleGetDropdownOptions(this.forAgent(payload));
 		});
 
 		this.eventBus.on(BrowserEventNames.SELECT_DROPDOWN_OPTION, async (payload: any) => {
-			await this.handleSelectDropdownOption(payload);
+			await this.handleSelectDropdownOption(this.forAgent(payload));
 		});
 
 		// Tabs. Nothing answered these two, so `switch` and `close` waited out
@@ -236,7 +257,14 @@ export class BrowserSession {
 				// Python: a null target means the most recently opened tab.
 				const targetId = payload?.targetId ?? Array.from(this.pages.keys()).pop();
 				if (!targetId) throw new Error('No tab to switch to');
-				await this.switchTab(String(targetId));
+				const home = typeof payload?.pageId === 'string' && this.agentHomes.has(payload.pageId) ? payload.pageId : undefined;
+				if (home) {
+					if (!this.pages.has(String(targetId))) throw new Error(`No tab with id ${targetId}`);
+					if (String(targetId) === home) this.agentFocus.delete(home);
+					else this.agentFocus.set(home, String(targetId));
+				} else {
+					await this.switchTab(String(targetId));
+				}
 				this.eventBus.respondToEvent(payload._eventId, null);
 			} catch (error: any) {
 				this.eventBus.rejectEvent(payload._eventId, error);
@@ -467,6 +495,8 @@ export class BrowserSession {
 
 		this.pages.clear();
 		this.pageOpeners.clear();
+		this.agentHomes.clear();
+		this.agentFocus.clear();
 		this.tabEvents = [];
 		this.currentPageId = undefined;
 		this.started = false;
@@ -810,10 +840,32 @@ export class BrowserSession {
 	 * Used by agents that may or may not have a specific tab assigned
 	 */
 	getPageOrCurrent(pageId?: string): Page {
-		if (pageId && this.pages.has(pageId)) {
-			return this.pages.get(pageId)!;
+		const id = pageId ? this.resolvePageId(pageId) : undefined;
+		if (id && this.pages.has(id)) {
+			return this.pages.get(id)!;
 		}
 		return this.getCurrentPage();
+	}
+
+	/** The tab a pinned agent is on now: its home, or the popup it followed. Any other id is returned as is. */
+	resolvePageId(pageId: string): string {
+		const focus = this.agentFocus.get(pageId);
+		return focus && this.pages.has(focus) ? focus : pageId;
+	}
+
+	/** The pinned agent whose current tab this is, if any. */
+	private homeOf(pageId: string): string | undefined {
+		for (const home of this.agentHomes) {
+			if (this.resolvePageId(home) === pageId) return home;
+		}
+		return undefined;
+	}
+
+	/** Event payloads carry the caller's home id: handlers work on the tab that agent is on now. */
+	private forAgent<T>(payload: T): T {
+		const p = payload as any;
+		if (p && typeof p.pageId === 'string' && p.pageId) p.pageId = this.resolvePageId(p.pageId);
+		return payload;
 	}
 
 	/**
@@ -827,6 +879,7 @@ export class BrowserSession {
 		}
 
 		const { pageId, page: newPage } = await this.openOwnPage(agentId ? `agent_${agentId}_${Date.now()}` : undefined);
+		this.agentHomes.add(pageId);
 
 		console.log(`🆕 [BrowserSession] Created new tab ${pageId} for agent${agentId ? ` ${agentId}` : ''}`);
 		console.log(`📊 [BrowserSession] Total tabs: ${this.pages.size}`);
@@ -846,6 +899,7 @@ export class BrowserSession {
 		includeDom?: boolean;
 		includeRecentEvents?: boolean;
 	} = {}): Promise<BrowserStateSummary> {
+		pageId = this.resolvePageId(pageId);
 		const page = this.pages.get(pageId);
 		if (!page) {
 			throw new Error(`Page ${pageId} not found`);
@@ -868,7 +922,7 @@ export class BrowserSession {
 	 * Falls back to session-wide cache if page-specific map not found
 	 */
 	getSelectorMapForPage(pageId: string): Map<number, EnhancedDOMTreeNode> {
-		const pageMap = this.pageSelectorMaps.get(pageId);
+		const pageMap = this.pageSelectorMaps.get(this.resolvePageId(pageId));
 		if (pageMap) {
 			return pageMap;
 		}
@@ -1082,6 +1136,7 @@ export class BrowserSession {
 			url: page.url(),
 			title: await page.title(),
 			tabs: await this.getAllTabs(),
+			tabNotes: this.drainTabNotes(page),
 			pageInfo,
 			pixelsAbove: pageInfo.pixelsAbove,
 			pixelsBelow: pageInfo.pixelsBelow,
@@ -1211,9 +1266,13 @@ export class BrowserSession {
 		if (openerId && this.pages.has(openerId)) {
 			this.pageOpeners.set(pageId, openerId);
 		}
-		const followed = !!openerId && openerId === this.currentPageId;
-		if (followed) this.focusPage(pageId);
-		if (announce) this.tabEvents.push({ type: 'opened', pageId, followed });
+		// The opener is a pinned agent's tab: that agent follows, nobody else moves.
+		const home = openerId ? this.homeOf(openerId) : undefined;
+		if (home) this.agentFocus.set(home, pageId);
+		const current = !!openerId && openerId === this.currentPageId;
+		const followed = !!home || current;
+		if (current) this.focusPage(pageId);
+		if (announce) this.tabEvents.push({ type: 'opened', pageId, followed, home });
 		console.log(`🆕 [BrowserSession] Adopted tab ${pageId}${openerId ? ` opened by ${openerId}` : ''}${followed ? ' (now current)' : ''}`);
 		return pageId;
 	}
@@ -1272,6 +1331,20 @@ export class BrowserSession {
 		}
 		const openerId = this.pageOpeners.get(pageId);
 		this.pageOpeners.delete(pageId);
+		this.agentHomes.delete(pageId);
+		this.agentFocus.delete(pageId);
+		for (const [home, focus] of this.agentFocus) {
+			if (focus !== pageId) continue;
+			if (openerId && openerId !== home && this.pages.has(openerId)) this.agentFocus.set(home, openerId);
+			else this.agentFocus.delete(home);
+		}
+		this.lastNetworkAt.delete(pageId);
+		for (const [url, started] of this.requestStarted) {
+			if (started.pageId === pageId) {
+				this.requestStarted.delete(url);
+				this.pendingRequests.delete(url);
+			}
+		}
 		if (this.currentPageId === pageId) {
 			this.currentPageId = undefined;
 			// The single-agent CDP session belonged to the closed page
@@ -1283,9 +1356,13 @@ export class BrowserSession {
 	}
 
 	/** What happened to tabs on their own since the last look, in words for the model. */
-	private drainTabNotes(): string[] {
-		const events = this.tabEvents;
-		this.tabEvents = [];
+	private drainTabNotes(reader?: Page): string[] {
+		// An event about a pinned agent's tab waits for that agent's next look;
+		// the rest go to whoever looks first.
+		const mine = (event: { home?: string }) =>
+			!event.home || !reader || !this.pages.has(event.home) || this.pages.get(this.resolvePageId(event.home)) === reader;
+		const events = this.tabEvents.filter(mine);
+		this.tabEvents = this.tabEvents.filter((event) => !mine(event));
 		const short = (id: string) => id.slice(-4);
 		const notes: string[] = [];
 		for (const event of events) {
@@ -1299,7 +1376,7 @@ export class BrowserSession {
 					// ignore
 				}
 				const where = url && !this.isNewTabPage(url) ? ` (${url.slice(0, 120)})` : '';
-				if (event.pageId === this.currentPageId) {
+				if (reader ? page === reader : event.pageId === this.currentPageId) {
 					notes.push(`The page opened a new tab [${short(event.pageId)}]${where}; you are on it now.`);
 				} else {
 					notes.push(`A new tab [${short(event.pageId)}]${where} opened in the background; switch to it if you need it.`);
@@ -1329,8 +1406,10 @@ export class BrowserSession {
 				// a closed page may not answer
 			}
 			const wasCurrent = this.currentPageId === pageId;
+			const home = this.homeOf(pageId);
 			this.forgetPage(pageId);
-			this.tabEvents.push({ type: 'closed', pageId, url, backOn: wasCurrent ? this.currentPageId : undefined });
+			const backOn = home && this.pages.has(home) ? this.resolvePageId(home) : wasCurrent ? this.currentPageId : undefined;
+			this.tabEvents.push({ type: 'closed', pageId, url, backOn, home: home && this.pages.has(home) ? home : undefined });
 			console.log(`🗑️ [BrowserSession] Page ${pageId} closed, cleaned up resources`);
 		});
 
@@ -1395,16 +1474,28 @@ export class BrowserSession {
 			const url = request.url();
 			if (!url.startsWith('data:') && !url.startsWith('blob:')) {
 				this.pendingRequests.add(url);
+				// A document request never reports back as finished here (measured:
+				// every navigation stayed "in flight" for good); document.readyState
+				// says when a navigation is done, so only subresources are timed.
+				let navigation = false;
+				try {
+					navigation = request.isNavigationRequest();
+				} catch {
+					// a request from a page that is already gone
+				}
+				if (!navigation) {
+					this.requestStarted.set(url, { at: Date.now(), pageId });
+					this.lastNetworkAt.set(pageId, Date.now());
+				}
 			}
 		});
 
-		page.on('requestfinished', (request) => {
-			this.pendingRequests.delete(request.url());
-		});
-
-		page.on('requestfailed', (request) => {
-			this.pendingRequests.delete(request.url());
-		});
+		const requestDone = (url: string) => {
+			this.pendingRequests.delete(url);
+			if (this.requestStarted.delete(url)) this.lastNetworkAt.set(pageId, Date.now());
+		};
+		page.on('requestfinished', (request) => requestDone(request.url()));
+		page.on('requestfailed', (request) => requestDone(request.url()));
 
 		// Download tracking
 		page.on('download', async (download) => {
@@ -1434,6 +1525,22 @@ export class BrowserSession {
 	 */
 	getPendingRequestCount(): number {
 		return this.pendingRequests.size;
+	}
+
+	/**
+	 * What one tab's network is doing right now: requests that started in the
+	 * last `freshMs` and are still in flight, and when its network last moved.
+	 * A request older than that is a long-poll, a stream or an analytics beacon:
+	 * nothing a reader of the page is waiting for (upstream's settle rule).
+	 */
+	networkActivity(pageId?: string, freshMs: number = 1500): { fresh: number; lastAt: number } {
+		const id = pageId && this.pages.has(pageId) ? pageId : this.currentPageId;
+		const now = Date.now();
+		let fresh = 0;
+		for (const started of this.requestStarted.values()) {
+			if (started.pageId === id && now - started.at < freshMs) fresh++;
+		}
+		return { fresh, lastAt: (id && this.lastNetworkAt.get(id)) || 0 };
 	}
 
 	/**
@@ -1938,17 +2045,18 @@ export class BrowserSession {
 					// If we have coordinates, check for occlusion (like Python lines 440-466)
 					if (clickCoords) {
 						// Check for occlusion before attempting CDP click (like Python _check_element_occlusion)
-						const isOccluded = await this.checkElementOcclusionCDP(
-							cdp,
-							backendNodeId,
-							clickCoords.x,
-							clickCoords.y
-						);
+						const cover = await this.resolveOcclusion(cdp, backendNodeId, clickCoords.x, clickCoords.y);
+						if (cover.point) {
+							clickCoords = cover.point;
+						}
 
-						if (isOccluded) {
+						if (cover.coveredBy) {
+							if (cover.modal) {
+								throw new CoveredByDialogError(cover.coveredBy);
+							}
 							console.debug('🚫 Element is occluded, falling back to JavaScript click');
 							await this.fallbackJSClick(page, node, pageId);
-							this.eventBus.respondToEvent(event._eventId, { success: true, method: 'js_click_occlusion' });
+							this.eventBus.respondToEvent(event._eventId, { success: true, method: 'js_click_occlusion', coveredBy: cover.coveredBy });
 							return;
 						}
 
@@ -2016,6 +2124,8 @@ export class BrowserSession {
 						return;
 					}
 				} catch (cdpError: any) {
+					// A refusal is the answer, not a failure to click some other way.
+					if (cdpError instanceof CoveredByDialogError) throw cdpError;
 					// Python: On CDP click error, try JS click immediately (lines 525-545)
 					console.debug('CDP click failed, falling back to JavaScript click:', cdpError.message);
 					try {
@@ -2081,16 +2191,21 @@ export class BrowserSession {
 			centerY = Math.max(1, Math.min(viewportSize.height - 1, centerY));
 
 			// Check for occlusion using CDP (like Python) - use backendNodeId if available
-			let isOccluded = false;
 			if (backendNodeId && backendNodeId > 0) {
-				isOccluded = await this.checkElementOcclusionCDP(cdp, backendNodeId, centerX, centerY);
-			}
-
-			if (isOccluded) {
-				console.debug('Element is occluded, falling back to JavaScript click');
-				await this.fallbackJSClick(page, node, pageId);
-				this.eventBus.respondToEvent(event._eventId, { success: true, method: 'js_click' });
-				return;
+				const cover = await this.resolveOcclusion(cdp, backendNodeId, centerX, centerY);
+				if (cover.point) {
+					centerX = cover.point.x;
+					centerY = cover.point.y;
+				}
+				if (cover.coveredBy) {
+					if (cover.modal) {
+						throw new CoveredByDialogError(cover.coveredBy);
+					}
+					console.debug('Element is occluded, falling back to JavaScript click');
+					await this.fallbackJSClick(page, node, pageId);
+					this.eventBus.respondToEvent(event._eventId, { success: true, method: 'js_click', coveredBy: cover.coveredBy });
+					return;
+				}
 			}
 
 			// Move mouse to element first (like human behavior)
@@ -2151,6 +2266,75 @@ export class BrowserSession {
 		} catch {
 			// If check fails, assume not occluded
 			return false;
+		}
+	}
+
+	/**
+	 * Something else is on top of the click point. Before giving up on a real
+	 * click: centre the target (a sticky header or footer over a control near
+	 * the viewport edge is clear once it is centred — upstream 1.0 `_point`),
+	 * and if it is still covered, say by what. A dialog that does not contain
+	 * the target is `modal`: a person could not click through it, so neither
+	 * does the agent. Never throws; with no answer the click proceeds as before.
+	 */
+	private async resolveOcclusion(
+		cdp: CDPSession,
+		backendNodeId: number,
+		x: number,
+		y: number
+	): Promise<{ point?: { x: number; y: number }; coveredBy?: string; modal?: boolean }> {
+		if (!(await this.checkElementOcclusionCDP(cdp, backendNodeId, x, y))) return {};
+		try {
+			const resolved = await cdp.send('DOM.resolveNode', { backendNodeId });
+			const objectId = (resolved as any)?.object?.objectId;
+			if (!objectId) return { coveredBy: 'another element' };
+			const result = await cdp.send('Runtime.callFunctionOn', {
+				objectId,
+				functionDeclaration: `
+					function() {
+						const el = this.nodeType === 1 ? this : this.parentElement;
+						if (!el || !el.isConnected) return null;
+						// Viewport coordinates are the frame's own inside an iframe: leave those to the caller's point.
+						const top = window === window.top;
+						const probe = () => {
+							const r = el.getBoundingClientRect();
+							const px = r.x + r.width / 2, py = r.y + r.height / 2;
+							const hit = el.getRootNode().elementFromPoint ? el.getRootNode().elementFromPoint(px, py) : document.elementFromPoint(px, py);
+							const inView = r.width > 0 && r.height > 0 && px >= 0 && py >= 0 && px < innerWidth && py < innerHeight;
+							const clear = inView && !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+							return { px, py, hit, clear };
+						};
+						let p = probe();
+						if (!p.clear && top) {
+							el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+							p = probe();
+						}
+						if (p.clear) return top ? { clear: true, x: p.px, y: p.py } : { clear: true };
+						const hit = p.hit;
+						if (!hit) return { clear: false, who: 'another element', modal: false };
+						const dialog = hit.closest('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]');
+						const modal = !!dialog && !dialog.contains(el);
+						const named = dialog || hit;
+						const label = (named.getAttribute('aria-label') || '').trim()
+							|| (named.querySelector && (named.querySelector('h1,h2,h3,[role="heading"]') || {}).textContent || '').trim()
+							|| (named.innerText || named.textContent || '').trim();
+						const role = named.getAttribute('role') || named.tagName.toLowerCase();
+						const id = named.id ? '#' + named.id : '';
+						const text = label.replace(/\\s+/g, ' ').slice(0, 60);
+						return { clear: false, modal, who: (modal ? 'a dialog ' : '') + '<' + role + id + '>' + (text ? ' "' + text + '"' : '') };
+					}
+				`,
+				returnByValue: true,
+			});
+			const data = (result as any)?.result?.value;
+			if (!data) return { coveredBy: 'another element' };
+			if (data.clear) {
+				return typeof data.x === 'number' && typeof data.y === 'number' ? { point: { x: data.x, y: data.y } } : {};
+			}
+			return { coveredBy: String(data.who || 'another element'), modal: !!data.modal };
+		} catch (error: any) {
+			console.debug(`Occlusion lookup failed: ${error.message}`);
+			return { coveredBy: 'another element' };
 		}
 	}
 
@@ -2987,7 +3171,7 @@ export class BrowserSession {
 				paginationButtons: [],
 				modalOverlays: lastPageState?.modalOverlays,
 				closedPopupMessages: this.drainClosedPopupMessages(),
-				tabNotes: this.drainTabNotes(),
+				tabNotes: this.drainTabNotes(page),
 			};
 
 			// Capture screenshot with element highlighting (like Python)
@@ -3721,6 +3905,7 @@ export class BrowserSession {
 
 		// Clear pending requests tracking
 		this.pendingRequests.clear();
+		this.requestStarted.clear();
 	}
 
 	/**
@@ -3977,6 +4162,7 @@ export class BrowserSession {
 	 * Each page gets its own CDP session to avoid conflicts between parallel agents
 	 */
 	async getCdpSessionForPage(pageId: string): Promise<CDPSession> {
+		pageId = this.resolvePageId(pageId);
 		const page = this.pages.get(pageId);
 		if (!page) {
 			throw new Error(`Page ${pageId} not found`);
@@ -4470,6 +4656,7 @@ export class BrowserSession {
 	 * Port from browser_use/browser/session.py highlight_interaction_element (lines 2033-2203)
 	 */
 	async highlightInteractionElement(node: EnhancedDOMTreeNode, pageId?: string): Promise<void> {
+		if (pageId) pageId = this.resolvePageId(pageId);
 		try {
 			// Get fresh coordinates using CDP (matching Python exactly)
 			// Python: rect = await self.get_element_coordinates(node.backend_node_id, cdp_session)

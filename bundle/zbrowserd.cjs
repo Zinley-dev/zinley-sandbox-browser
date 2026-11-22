@@ -36353,6 +36353,12 @@ function getRealChromeProfilePath() {
     return `${home}/.config/google-chrome`;
   }
 }
+var CoveredByDialogError = class extends Error {
+  constructor(coveredBy) {
+    super(`Element is covered by ${coveredBy}; nothing was clicked. Deal with that first (Accept / Close / \u2715 / Esc), then look at the page again.`);
+    this.name = "CoveredByDialogError";
+  }
+};
 var BrowserSession = class {
   id;
   eventBus;
@@ -36373,8 +36379,17 @@ var BrowserSession = class {
   pageOpeners = /* @__PURE__ */ new Map();
   /** Our own context.newPage() calls in flight: their 'page' event is not a tab to adopt. */
   ownPageCreations = 0;
-  /** Tabs that opened or closed on their own since the last browser state. */
+  /** Tabs that opened or closed on their own since the last browser state. `home` names the pinned agent it concerns. */
   tabEvents = [];
+  /**
+   * Agents that share this browser are pinned to a tab of their own (its id
+   * is their `pageId`, their "home"). When that agent's page opens a popup the
+   * agent follows it exactly as a lone agent does, without moving anyone
+   * else: home → the tab that agent is on now. Every per-tab entry point
+   * resolves a pageId through this map, so callers keep passing their home id.
+   */
+  agentHomes = /* @__PURE__ */ new Set();
+  agentFocus = /* @__PURE__ */ new Map();
   // Cached selector map for element lookup by index (session-wide for single agent)
   cachedSelectorMap = /* @__PURE__ */ new Map();
   cachedBrowserStateSummary = null;
@@ -36383,6 +36398,10 @@ var BrowserSession = class {
   pageSelectorMaps = /* @__PURE__ */ new Map();
   // Network idle detection
   pendingRequests = /* @__PURE__ */ new Set();
+  /** In-flight request → when it started and on which tab (see networkActivity). */
+  requestStarted = /* @__PURE__ */ new Map();
+  /** Tab id → when its network last moved (a request started, finished or failed). */
+  lastNetworkAt = /* @__PURE__ */ new Map();
   networkIdleConfig = {
     enabled: true,
     idleTime: 0.5,
@@ -36416,52 +36435,59 @@ var BrowserSession = class {
   }
   registerEventHandlers() {
     this.eventBus.on(BrowserEventNames.NAVIGATE_TO_URL, async (payload) => {
-      await this.handleNavigateToUrl(payload);
+      await this.handleNavigateToUrl(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.CLICK_ELEMENT, async (payload) => {
-      await this.handleClickElement(payload);
+      await this.handleClickElement(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.TYPE_TEXT, async (payload) => {
-      await this.handleTypeText(payload);
+      await this.handleTypeText(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.SCROLL, async (payload) => {
-      await this.handleScroll(payload);
+      await this.handleScroll(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.BROWSER_STATE_REQUEST, async (payload) => {
-      await this.handleBrowserStateRequest(payload);
+      await this.handleBrowserStateRequest(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.SCREENSHOT, async (payload) => {
-      await this.handleScreenshot(payload);
+      await this.handleScreenshot(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.GO_BACK, async (payload) => {
-      await this.handleGoBack(payload);
+      await this.handleGoBack(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.GO_FORWARD, async (payload) => {
-      await this.handleGoForward(payload);
+      await this.handleGoForward(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.REFRESH, async (payload) => {
-      await this.handleRefresh(payload);
+      await this.handleRefresh(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.WAIT, async (payload) => {
-      await this.handleWait(payload);
+      await this.handleWait(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.SEND_KEYS, async (payload) => {
-      await this.handleSendKeys(payload);
+      await this.handleSendKeys(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.UPLOAD_FILE, async (payload) => {
-      await this.handleUploadFile(payload);
+      await this.handleUploadFile(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.GET_DROPDOWN_OPTIONS, async (payload) => {
-      await this.handleGetDropdownOptions(payload);
+      await this.handleGetDropdownOptions(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.SELECT_DROPDOWN_OPTION, async (payload) => {
-      await this.handleSelectDropdownOption(payload);
+      await this.handleSelectDropdownOption(this.forAgent(payload));
     });
     this.eventBus.on(BrowserEventNames.SWITCH_TAB, async (payload) => {
       try {
         const targetId = payload?.targetId ?? Array.from(this.pages.keys()).pop();
         if (!targetId) throw new Error("No tab to switch to");
-        await this.switchTab(String(targetId));
+        const home = typeof payload?.pageId === "string" && this.agentHomes.has(payload.pageId) ? payload.pageId : void 0;
+        if (home) {
+          if (!this.pages.has(String(targetId))) throw new Error(`No tab with id ${targetId}`);
+          if (String(targetId) === home) this.agentFocus.delete(home);
+          else this.agentFocus.set(home, String(targetId));
+        } else {
+          await this.switchTab(String(targetId));
+        }
         this.eventBus.respondToEvent(payload._eventId, null);
       } catch (error) {
         this.eventBus.rejectEvent(payload._eventId, error);
@@ -36634,6 +36660,8 @@ var BrowserSession = class {
     }
     this.pages.clear();
     this.pageOpeners.clear();
+    this.agentHomes.clear();
+    this.agentFocus.clear();
     this.tabEvents = [];
     this.currentPageId = void 0;
     this.started = false;
@@ -36884,10 +36912,29 @@ var BrowserSession = class {
    * Used by agents that may or may not have a specific tab assigned
    */
   getPageOrCurrent(pageId) {
-    if (pageId && this.pages.has(pageId)) {
-      return this.pages.get(pageId);
+    const id = pageId ? this.resolvePageId(pageId) : void 0;
+    if (id && this.pages.has(id)) {
+      return this.pages.get(id);
     }
     return this.getCurrentPage();
+  }
+  /** The tab a pinned agent is on now: its home, or the popup it followed. Any other id is returned as is. */
+  resolvePageId(pageId) {
+    const focus = this.agentFocus.get(pageId);
+    return focus && this.pages.has(focus) ? focus : pageId;
+  }
+  /** The pinned agent whose current tab this is, if any. */
+  homeOf(pageId) {
+    for (const home of this.agentHomes) {
+      if (this.resolvePageId(home) === pageId) return home;
+    }
+    return void 0;
+  }
+  /** Event payloads carry the caller's home id: handlers work on the tab that agent is on now. */
+  forAgent(payload) {
+    const p2 = payload;
+    if (p2 && typeof p2.pageId === "string" && p2.pageId) p2.pageId = this.resolvePageId(p2.pageId);
+    return payload;
   }
   /**
    * Create a new tab for an agent
@@ -36899,6 +36946,7 @@ var BrowserSession = class {
       throw new Error("Browser context not available - call start() first");
     }
     const { pageId, page: newPage } = await this.openOwnPage(agentId ? `agent_${agentId}_${Date.now()}` : void 0);
+    this.agentHomes.add(pageId);
     console.log(`\u{1F195} [BrowserSession] Created new tab ${pageId} for agent${agentId ? ` ${agentId}` : ""}`);
     console.log(`\u{1F4CA} [BrowserSession] Total tabs: ${this.pages.size}`);
     return { pageId, page: newPage };
@@ -36911,6 +36959,7 @@ var BrowserSession = class {
    * It directly uses the specified page without modifying currentPageId.
    */
   async getStateForPage(pageId, options = {}) {
+    pageId = this.resolvePageId(pageId);
     const page = this.pages.get(pageId);
     if (!page) {
       throw new Error(`Page ${pageId} not found`);
@@ -36926,7 +36975,7 @@ var BrowserSession = class {
    * Falls back to session-wide cache if page-specific map not found
    */
   getSelectorMapForPage(pageId) {
-    const pageMap = this.pageSelectorMaps.get(pageId);
+    const pageMap = this.pageSelectorMaps.get(this.resolvePageId(pageId));
     if (pageMap) {
       return pageMap;
     }
@@ -37068,6 +37117,7 @@ var BrowserSession = class {
       url: page.url(),
       title: await page.title(),
       tabs: await this.getAllTabs(),
+      tabNotes: this.drainTabNotes(page),
       pageInfo,
       pixelsAbove: pageInfo.pixelsAbove,
       pixelsBelow: pageInfo.pixelsBelow,
@@ -37181,9 +37231,12 @@ var BrowserSession = class {
     if (openerId && this.pages.has(openerId)) {
       this.pageOpeners.set(pageId, openerId);
     }
-    const followed = !!openerId && openerId === this.currentPageId;
-    if (followed) this.focusPage(pageId);
-    if (announce) this.tabEvents.push({ type: "opened", pageId, followed });
+    const home = openerId ? this.homeOf(openerId) : void 0;
+    if (home) this.agentFocus.set(home, pageId);
+    const current = !!openerId && openerId === this.currentPageId;
+    const followed = !!home || current;
+    if (current) this.focusPage(pageId);
+    if (announce) this.tabEvents.push({ type: "opened", pageId, followed, home });
     console.log(`\u{1F195} [BrowserSession] Adopted tab ${pageId}${openerId ? ` opened by ${openerId}` : ""}${followed ? " (now current)" : ""}`);
     return pageId;
   }
@@ -37241,6 +37294,20 @@ var BrowserSession = class {
     }
     const openerId = this.pageOpeners.get(pageId);
     this.pageOpeners.delete(pageId);
+    this.agentHomes.delete(pageId);
+    this.agentFocus.delete(pageId);
+    for (const [home, focus] of this.agentFocus) {
+      if (focus !== pageId) continue;
+      if (openerId && openerId !== home && this.pages.has(openerId)) this.agentFocus.set(home, openerId);
+      else this.agentFocus.delete(home);
+    }
+    this.lastNetworkAt.delete(pageId);
+    for (const [url, started] of this.requestStarted) {
+      if (started.pageId === pageId) {
+        this.requestStarted.delete(url);
+        this.pendingRequests.delete(url);
+      }
+    }
     if (this.currentPageId === pageId) {
       this.currentPageId = void 0;
       this.cdpSession = null;
@@ -37250,9 +37317,10 @@ var BrowserSession = class {
     }
   }
   /** What happened to tabs on their own since the last look, in words for the model. */
-  drainTabNotes() {
-    const events = this.tabEvents;
-    this.tabEvents = [];
+  drainTabNotes(reader) {
+    const mine = (event) => !event.home || !reader || !this.pages.has(event.home) || this.pages.get(this.resolvePageId(event.home)) === reader;
+    const events = this.tabEvents.filter(mine);
+    this.tabEvents = this.tabEvents.filter((event) => !mine(event));
     const short = (id) => id.slice(-4);
     const notes = [];
     for (const event of events) {
@@ -37265,7 +37333,7 @@ var BrowserSession = class {
         } catch {
         }
         const where = url && !this.isNewTabPage(url) ? ` (${url.slice(0, 120)})` : "";
-        if (event.pageId === this.currentPageId) {
+        if (reader ? page === reader : event.pageId === this.currentPageId) {
           notes.push(`The page opened a new tab [${short(event.pageId)}]${where}; you are on it now.`);
         } else {
           notes.push(`A new tab [${short(event.pageId)}]${where} opened in the background; switch to it if you need it.`);
@@ -37290,8 +37358,10 @@ var BrowserSession = class {
       } catch {
       }
       const wasCurrent = this.currentPageId === pageId;
+      const home = this.homeOf(pageId);
       this.forgetPage(pageId);
-      this.tabEvents.push({ type: "closed", pageId, url, backOn: wasCurrent ? this.currentPageId : void 0 });
+      const backOn = home && this.pages.has(home) ? this.resolvePageId(home) : wasCurrent ? this.currentPageId : void 0;
+      this.tabEvents.push({ type: "closed", pageId, url, backOn, home: home && this.pages.has(home) ? home : void 0 });
       console.log(`\u{1F5D1}\uFE0F [BrowserSession] Page ${pageId} closed, cleaned up resources`);
     });
     page.on("framenavigated", (frame) => {
@@ -37341,14 +37411,23 @@ var BrowserSession = class {
       const url = request.url();
       if (!url.startsWith("data:") && !url.startsWith("blob:")) {
         this.pendingRequests.add(url);
+        let navigation = false;
+        try {
+          navigation = request.isNavigationRequest();
+        } catch {
+        }
+        if (!navigation) {
+          this.requestStarted.set(url, { at: Date.now(), pageId });
+          this.lastNetworkAt.set(pageId, Date.now());
+        }
       }
     });
-    page.on("requestfinished", (request) => {
-      this.pendingRequests.delete(request.url());
-    });
-    page.on("requestfailed", (request) => {
-      this.pendingRequests.delete(request.url());
-    });
+    const requestDone = (url) => {
+      this.pendingRequests.delete(url);
+      if (this.requestStarted.delete(url)) this.lastNetworkAt.set(pageId, Date.now());
+    };
+    page.on("requestfinished", (request) => requestDone(request.url()));
+    page.on("requestfailed", (request) => requestDone(request.url()));
     page.on("download", async (download) => {
       try {
         const suggestedFilename = download.suggestedFilename();
@@ -37372,6 +37451,21 @@ var BrowserSession = class {
    */
   getPendingRequestCount() {
     return this.pendingRequests.size;
+  }
+  /**
+   * What one tab's network is doing right now: requests that started in the
+   * last `freshMs` and are still in flight, and when its network last moved.
+   * A request older than that is a long-poll, a stream or an analytics beacon:
+   * nothing a reader of the page is waiting for (upstream's settle rule).
+   */
+  networkActivity(pageId, freshMs = 1500) {
+    const id = pageId && this.pages.has(pageId) ? pageId : this.currentPageId;
+    const now = Date.now();
+    let fresh = 0;
+    for (const started of this.requestStarted.values()) {
+      if (started.pageId === id && now - started.at < freshMs) fresh++;
+    }
+    return { fresh, lastAt: id && this.lastNetworkAt.get(id) || 0 };
   }
   /**
    * Wait for network to become idle
@@ -37763,16 +37857,17 @@ var BrowserSession = class {
             }
           }
           if (clickCoords) {
-            const isOccluded2 = await this.checkElementOcclusionCDP(
-              cdp,
-              backendNodeId,
-              clickCoords.x,
-              clickCoords.y
-            );
-            if (isOccluded2) {
+            const cover = await this.resolveOcclusion(cdp, backendNodeId, clickCoords.x, clickCoords.y);
+            if (cover.point) {
+              clickCoords = cover.point;
+            }
+            if (cover.coveredBy) {
+              if (cover.modal) {
+                throw new CoveredByDialogError(cover.coveredBy);
+              }
               console.debug("\u{1F6AB} Element is occluded, falling back to JavaScript click");
               await this.fallbackJSClick(page, node, pageId);
-              this.eventBus.respondToEvent(event._eventId, { success: true, method: "js_click_occlusion" });
+              this.eventBus.respondToEvent(event._eventId, { success: true, method: "js_click_occlusion", coveredBy: cover.coveredBy });
               return;
             }
             await cdp.send("Input.dispatchMouseEvent", {
@@ -37833,6 +37928,7 @@ var BrowserSession = class {
             return;
           }
         } catch (cdpError) {
+          if (cdpError instanceof CoveredByDialogError) throw cdpError;
           console.debug("CDP click failed, falling back to JavaScript click:", cdpError.message);
           try {
             await this.fallbackJSClick(page, node, pageId);
@@ -37874,15 +37970,21 @@ var BrowserSession = class {
       }
       centerX = Math.max(1, Math.min(viewportSize.width - 1, centerX));
       centerY = Math.max(1, Math.min(viewportSize.height - 1, centerY));
-      let isOccluded = false;
       if (backendNodeId && backendNodeId > 0) {
-        isOccluded = await this.checkElementOcclusionCDP(cdp, backendNodeId, centerX, centerY);
-      }
-      if (isOccluded) {
-        console.debug("Element is occluded, falling back to JavaScript click");
-        await this.fallbackJSClick(page, node, pageId);
-        this.eventBus.respondToEvent(event._eventId, { success: true, method: "js_click" });
-        return;
+        const cover = await this.resolveOcclusion(cdp, backendNodeId, centerX, centerY);
+        if (cover.point) {
+          centerX = cover.point.x;
+          centerY = cover.point.y;
+        }
+        if (cover.coveredBy) {
+          if (cover.modal) {
+            throw new CoveredByDialogError(cover.coveredBy);
+          }
+          console.debug("Element is occluded, falling back to JavaScript click");
+          await this.fallbackJSClick(page, node, pageId);
+          this.eventBus.respondToEvent(event._eventId, { success: true, method: "js_click", coveredBy: cover.coveredBy });
+          return;
+        }
       }
       await page.mouse.move(centerX, centerY);
       await new Promise((r2) => setTimeout(r2, 50));
@@ -37919,6 +38021,69 @@ var BrowserSession = class {
       return result;
     } catch {
       return false;
+    }
+  }
+  /**
+   * Something else is on top of the click point. Before giving up on a real
+   * click: centre the target (a sticky header or footer over a control near
+   * the viewport edge is clear once it is centred — upstream 1.0 `_point`),
+   * and if it is still covered, say by what. A dialog that does not contain
+   * the target is `modal`: a person could not click through it, so neither
+   * does the agent. Never throws; with no answer the click proceeds as before.
+   */
+  async resolveOcclusion(cdp, backendNodeId, x2, y2) {
+    if (!await this.checkElementOcclusionCDP(cdp, backendNodeId, x2, y2)) return {};
+    try {
+      const resolved = await cdp.send("DOM.resolveNode", { backendNodeId });
+      const objectId = resolved?.object?.objectId;
+      if (!objectId) return { coveredBy: "another element" };
+      const result = await cdp.send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `
+					function() {
+						const el = this.nodeType === 1 ? this : this.parentElement;
+						if (!el || !el.isConnected) return null;
+						// Viewport coordinates are the frame's own inside an iframe: leave those to the caller's point.
+						const top = window === window.top;
+						const probe = () => {
+							const r = el.getBoundingClientRect();
+							const px = r.x + r.width / 2, py = r.y + r.height / 2;
+							const hit = el.getRootNode().elementFromPoint ? el.getRootNode().elementFromPoint(px, py) : document.elementFromPoint(px, py);
+							const inView = r.width > 0 && r.height > 0 && px >= 0 && py >= 0 && px < innerWidth && py < innerHeight;
+							const clear = inView && !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+							return { px, py, hit, clear };
+						};
+						let p = probe();
+						if (!p.clear && top) {
+							el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+							p = probe();
+						}
+						if (p.clear) return top ? { clear: true, x: p.px, y: p.py } : { clear: true };
+						const hit = p.hit;
+						if (!hit) return { clear: false, who: 'another element', modal: false };
+						const dialog = hit.closest('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]');
+						const modal = !!dialog && !dialog.contains(el);
+						const named = dialog || hit;
+						const label = (named.getAttribute('aria-label') || '').trim()
+							|| (named.querySelector && (named.querySelector('h1,h2,h3,[role="heading"]') || {}).textContent || '').trim()
+							|| (named.innerText || named.textContent || '').trim();
+						const role = named.getAttribute('role') || named.tagName.toLowerCase();
+						const id = named.id ? '#' + named.id : '';
+						const text = label.replace(/\\s+/g, ' ').slice(0, 60);
+						return { clear: false, modal, who: (modal ? 'a dialog ' : '') + '<' + role + id + '>' + (text ? ' "' + text + '"' : '') };
+					}
+				`,
+        returnByValue: true
+      });
+      const data = result?.result?.value;
+      if (!data) return { coveredBy: "another element" };
+      if (data.clear) {
+        return typeof data.x === "number" && typeof data.y === "number" ? { point: { x: data.x, y: data.y } } : {};
+      }
+      return { coveredBy: String(data.who || "another element"), modal: !!data.modal };
+    } catch (error) {
+      console.debug(`Occlusion lookup failed: ${error.message}`);
+      return { coveredBy: "another element" };
     }
   }
   /**
@@ -38654,7 +38819,7 @@ var BrowserSession = class {
         paginationButtons: [],
         modalOverlays: lastPageState?.modalOverlays,
         closedPopupMessages: this.drainClosedPopupMessages(),
-        tabNotes: this.drainTabNotes()
+        tabNotes: this.drainTabNotes(page)
       };
       if (event.includeScreenshot !== false) {
         await this.removeHighlights().catch(() => {
@@ -39216,6 +39381,7 @@ var BrowserSession = class {
       selectorMap.clear();
     }
     this.pendingRequests.clear();
+    this.requestStarted.clear();
   }
   /**
    * Find element index by its id attribute
@@ -39427,6 +39593,7 @@ var BrowserSession = class {
    * Each page gets its own CDP session to avoid conflicts between parallel agents
    */
   async getCdpSessionForPage(pageId) {
+    pageId = this.resolvePageId(pageId);
     const page = this.pages.get(pageId);
     if (!page) {
       throw new Error(`Page ${pageId} not found`);
@@ -39811,6 +39978,7 @@ var BrowserSession = class {
    * Port from browser_use/browser/session.py highlight_interaction_element (lines 2033-2203)
    */
   async highlightInteractionElement(node, pageId) {
+    if (pageId) pageId = this.resolvePageId(pageId);
     try {
       const rect = await this.getElementCoordinatesByBackendNodeId(node.backendNodeId, pageId);
       if (!rect) {
@@ -43540,6 +43708,9 @@ async function detectNewTabOpened(context, tabsBefore) {
     if (!context.pageId && context.browserSession.switchToPage(newTabId)) {
       return `. Automatically switched to new tab (tab_id: ${shortId}).`;
     }
+    if (context.pageId && context.browserSession.resolvePageId(context.pageId) === newTabId) {
+      return `. Automatically switched to new tab (tab_id: ${shortId}).`;
+    }
     return `. Note: This opened a new tab (tab_id: ${shortId}) - switch to it if you need to interact with the new page.`;
   } catch {
     return "";
@@ -43738,6 +43909,9 @@ async function clickByIndex(params, context) {
       throw error;
     }
     let memory = `Clicked ${elementDesc}`;
+    if (clickMetadata && typeof clickMetadata.coveredBy === "string" && clickMetadata.coveredBy) {
+      memory += ` (it was covered by ${clickMetadata.coveredBy}, so it was clicked by script; if nothing happened, deal with what covers it first)`;
+    }
     memory += await detectNewTabOpened(context, tabsBefore);
     console.info(`\u{1F5B1}\uFE0F ${memory}`);
     return {
@@ -43813,11 +43987,15 @@ async function typeText(params, context) {
       },
       TIMEOUTS.TYPE_TEXT
     );
+    const isPasswordField = String(element.nodeName || "").toLowerCase() === "input" && String(element.attributes?.type || "").toLowerCase() === "password";
     let msg;
     let logMsg;
     if (hasSensitiveData) {
       msg = sensitiveKeyName ? `Typed ${sensitiveKeyName}` : "Typed sensitive data";
       logMsg = sensitiveKeyName ? `Typed <${sensitiveKeyName}>` : "Typed <sensitive>";
+    } else if (isPasswordField) {
+      msg = `Typed ${params.text.length} characters into the password field (hidden)`;
+      logMsg = msg;
     } else {
       msg = `Typed '${params.text}'`;
       logMsg = msg;
@@ -43827,7 +44005,7 @@ async function typeText(params, context) {
     if (inputMetadata && typeof inputMetadata === "object") {
       const { actualValue, actual_value, ...rest } = inputMetadata;
       const actual = actualValue ?? actual_value;
-      if (!hasSensitiveData && typeof actual === "string" && actual !== params.text) {
+      if (!hasSensitiveData && !isPasswordField && typeof actual === "string" && actual !== params.text) {
         msg += `
 \u26A0\uFE0F Note: the field's actual value '${actual}' differs from typed text '${params.text}'. The page may have reformatted or autocompleted your input.`;
       }
@@ -43949,7 +44127,7 @@ async function switchTab(params, context) {
   try {
     await context.browserSession.eventBus.dispatch(
       BrowserEventNames.SWITCH_TAB,
-      { targetId },
+      { targetId, pageId: context.pageId },
       TIMEOUTS.SWITCH_TAB
     );
   } catch (error) {
@@ -55620,10 +55798,15 @@ ${elements}`;
       elements = "empty page";
     }
     if (elements.length > maxChars) {
-      const nl = elements.lastIndexOf("\n", maxChars);
-      const keep = nl > maxChars / 2 ? nl : maxChars;
+      const headBudget = Math.floor(maxChars * 0.8);
+      const nl = elements.lastIndexOf("\n", headBudget);
+      const keep = nl > headBudget / 2 ? nl : headBudget;
+      const tailFrom = elements.indexOf("\n", elements.length - (maxChars - headBudget));
+      const tail = tailFrom > keep ? elements.slice(tailFrom + 1) : "";
+      const cut = elements.length - keep - tail.length;
       elements = `${elements.slice(0, keep)}
-\u2026 (${elements.length - keep} more chars not shown; scroll or narrow the page)`;
+\u2026 (${cut} chars not shown here; scroll or narrow the page)${tail ? `
+${tail}` : ""}`;
       out.elementsTruncated = true;
     }
     out.elements = elements;
@@ -55882,6 +56065,7 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
   const results = [];
   let interrupted;
   const urlBefore = await session.getCurrentPageUrl().catch(() => "");
+  const watched = [];
   const planned = Math.min(actions.length, max);
   const notRun = (i2) => i2 < planned - 1 ? ` The remaining ${planned - i2 - 1} action(s) were not run.` : "";
   for (let i2 = 0; i2 < planned; i2++) {
@@ -55896,7 +56080,10 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
       if (action === "navigate" && typeof useParams.url === "string") useParams.url = normalizeUrl(useParams.url);
       let retargetNote = "";
       const isGone = (r3) => !r3?.error && typeof r3?.extractedContent === "string" && /^Element index \d+ not available/.test(r3.extractedContent) || typeof r3?.error === "string" && /^Element (?:index |with index )?\d+ not (?:available|found)/i.test(r3.error);
+      const before = MOVING_ACTIONS.has(action) ? await probeChange(session) : null;
+      const tabsBefore = before ? tabCount(session) : 0;
       let r2 = await registry.execute(action, useParams, context, { actionTimeoutS: opts.actionTimeoutS ?? 60 });
+      if (before) watched.push({ result: results.length, before, tabs: tabsBefore });
       if (isGone(r2) && typeof useParams.index === "number") {
         const again = await retarget(session, useParams.index);
         if (again) {
@@ -55953,6 +56140,20 @@ async function runStepActions(session, registry, actions, context, opts = {}) {
     const ran = results.filter((r2) => r2.ok).map((r2) => r2.action);
     const light = ran.every((a2) => LIGHT_ACTIONS.has(a2)) && !ran.some((a2, i2) => a2 === "send_keys" && /enter|return/i.test(String(results[i2]?.message || "")));
     await settleAfterActions(session, light ? { light: true, scrolled: ran.includes("scroll") } : void 0);
+    const last = watched[watched.length - 1];
+    if (last && last.result === results.length - 1 && results[last.result]?.ok) {
+      const same = (p2) => !!p2 && p2.doc === last.before.doc && p2.url === last.before.url && p2.n === last.before.n && tabCount(session) === last.tabs;
+      let unchanged = same(await probeChange(session));
+      if (unchanged) {
+        await new Promise((resolve3) => setTimeout(resolve3, 350));
+        unchanged = same(await probeChange(session));
+      }
+      if (unchanged) {
+        const note = "Nothing on the page changed after this (no navigation, no new or removed content, no field edited).";
+        results[last.result].message = results[last.result].message ? `${results[last.result].message}
+${note}` : note;
+      }
+    }
   }
   return { ok: results.length > 0 && results.every((r2) => r2.ok), results, interrupted };
 }
@@ -56000,16 +56201,106 @@ async function settleAfterActions(session, opts = {}) {
   try {
     const page = session.getPageOrCurrent();
     if (opts.light) {
+      if (await settleQuiet(session, { minMs: 250, quietMs: 100, capMs: opts.scrolled ? 1500 : 900 })) return;
       await new Promise((resolve3) => setTimeout(resolve3, 250));
       await waitUntilStable(page, { maxMs: opts.scrolled ? 1500 : 900, intervalMs: 300 });
       return;
     }
     await page.waitForLoadState("domcontentloaded", { timeout: 2e3 }).catch(() => void 0);
+    if (await settleQuiet(session, { minMs: 0, quietMs: 150, capMs: 4e3 })) return;
     const idle = session.waitForNetworkIdle;
     if (typeof idle === "function") await idle.call(session, { idleTime: 0.25, timeout: 1.2 }).catch(() => void 0);
     await waitUntilStable(page);
   } catch {
   }
+}
+var MOVING_ACTIONS = /* @__PURE__ */ new Set(["click", "send_keys"]);
+var OWN_OVERLAYS = `#${OVERLAY_ID},[data-browser-use-interaction-highlight],[data-browser-use-highlight]`;
+var CHANGE_PROBE = `(() => {
+	const w = window;
+	const watch = (win, counted) => {
+		const doc = win.document;
+		if (doc.__zbWatched) return;
+		doc.__zbWatched = true;
+		if (counted) { w.__zbLast = performance.now(); w.__zbN++; }
+		const styled = new WeakMap();
+		new MutationObserver((records) => {
+			const now = performance.now();
+			let real = false;
+			for (const r of records) {
+				// Our own drawings (index boxes, the click highlight) are not the page reacting.
+				const own = (n) => { const e = n && (n.nodeType === 1 ? n : n.parentElement); return !!(e && e.closest && e.closest(${JSON.stringify(OWN_OVERLAYS)})); };
+				if (own(r.target) || Array.from(r.addedNodes).concat(Array.from(r.removedNodes)).some(own)) continue;
+				if (r.attributeName && r.oldValue === r.target.getAttributeNS(r.attributeNamespace, r.attributeName)) continue;
+				if (r.attributeName !== 'style') real = true;
+				else if (now - (styled.get(r.target) ?? -1e9) > 200) real = true;
+				if (r.attributeName === 'style') styled.set(r.target, now);
+			}
+			if (real) { w.__zbLast = now; w.__zbN++; }
+		}).observe(doc, { subtree: true, childList: true, attributes: true, attributeOldValue: true, characterData: true });
+		for (const type of ['input', 'change']) win.addEventListener(type, () => { w.__zbN++; }, true);
+	};
+	const first = !w.__zbObs;
+	if (first) {
+		w.__zbObs = true;
+		w.__zbLast = performance.now();
+		w.__zbN = 0;
+		w.__zbDoc = Math.random();
+		watch(w, false);
+	}
+	const frames = (win) => {
+		for (let i = 0; i < win.frames.length; i++) {
+			let f;
+			try { f = win.frames[i]; if (!f.document) continue; } catch { continue; }
+			watch(f, !first);
+			frames(f);
+		}
+	};
+	frames(w);
+	return { idle: performance.now() - w.__zbLast, ready: document.readyState, url: location.href, n: w.__zbN, doc: w.__zbDoc };
+})()`;
+async function probeChange(session) {
+  try {
+    const page = session.getPageOrCurrent();
+    const p2 = await page.evaluate(CHANGE_PROBE);
+    return p2 && typeof p2 === "object" && typeof p2.idle === "number" && typeof p2.n === "number" ? p2 : null;
+  } catch {
+    return null;
+  }
+}
+function tabCount(session) {
+  try {
+    return session.getAllTabIds?.().length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+async function settleQuiet(session, opts) {
+  const started = Date.now();
+  let limit2 = opts.capMs;
+  let seen = false;
+  while (Date.now() - started < limit2) {
+    const probe = await probeChange(session);
+    if (!probe) {
+      if (!seen && Date.now() - started > 400) return false;
+      await new Promise((resolve3) => setTimeout(resolve3, 40));
+      continue;
+    }
+    seen = true;
+    const elapsed = Date.now() - started;
+    if (probe.ready === "loading") limit2 = Math.max(opts.capMs, 3e3);
+    const idle = Math.min(probe.idle, elapsed);
+    let busy = false;
+    try {
+      const net = session.networkActivity?.();
+      if (net) busy = net.fresh > 0 || net.lastAt > 0 && Date.now() - net.lastAt < opts.quietMs;
+    } catch {
+    }
+    if (probe.ready !== "loading" && idle >= opts.quietMs && !busy && elapsed >= opts.minMs) return true;
+    const wait2 = probe.ready === "loading" || busy ? 40 : Math.max(20, Math.min(opts.quietMs - idle, 100), opts.minMs - elapsed);
+    await new Promise((resolve3) => setTimeout(resolve3, Math.min(wait2, 250)));
+  }
+  return seen;
 }
 var STABLE_PROBE = `(() => { const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; }; let n = 0; for (const e of document.querySelectorAll('a[href],button,input,select,textarea,[role=button],[role=link],[onclick]')) if (vis(e)) n++; return document.readyState + ':' + n; })()`;
 var LOADING_PROBE = `(() => {
